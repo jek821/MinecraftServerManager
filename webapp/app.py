@@ -1,5 +1,6 @@
 import hashlib
 import io
+import ipaddress
 import json
 import os
 import re
@@ -18,10 +19,11 @@ from functools import wraps
 from pathlib import Path
 
 import requests
-from flask import Flask, jsonify, render_template, request, send_file, session
+from flask import Flask, Response, jsonify, render_template, request, send_file, session
 from PIL import Image as PILImage
 
 from port_proxy import start_port_proxy
+from tls_certs import ensure_tls_context
 
 app = Flask(__name__)
 
@@ -127,6 +129,70 @@ def _mc_internal_port() -> int:
 
 def _public_port() -> int:
     return int(load_config().get('public_port', DEFAULT_PUBLIC_PORT))
+
+
+def _is_private_host(host: str) -> bool:
+    host = host.strip()
+    if host in ('localhost', '127.0.0.1', '::1'):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_private
+    except ValueError:
+        return False
+
+
+def _resource_pack_scheme(host: str) -> str:
+    """Use HTTPS only when explicitly enabled (requires a real TLS cert, not self-signed)."""
+    if load_config().get('resource_pack_https') and not _is_private_host(host):
+        return 'https'
+    return 'http'
+
+
+def _resource_pack_url(world_name: str, host: str) -> str:
+    scheme = _resource_pack_scheme(host)
+    return f'{scheme}://{host}:{_public_port()}/resourcepack/{world_name}.zip'
+
+
+def _ensure_pack_cache(world_dir: Path) -> Path:
+    cached = world_dir / '.resource_pack.zip'
+    if not cached.exists():
+        cached.write_bytes(_build_resource_pack_zip(_paintings_dir(world_dir)))
+    return cached
+
+
+def _pack_file_response(world_dir: Path) -> Response:
+    cached = _ensure_pack_cache(world_dir)
+    data = cached.read_bytes()
+    return Response(
+        data,
+        mimetype='application/zip',
+        headers={
+            'Content-Length': str(len(data)),
+            'Content-Disposition': f'attachment; filename="{world_dir.name}_paintings.zip"',
+            'Cache-Control': 'no-store',
+        },
+    )
+
+
+def _test_resource_pack_url(url: str) -> dict:
+    """Verify the pack is reachable through the public port proxy."""
+    try:
+        verify = not url.startswith('https://')
+        resp = requests.get(url, timeout=15, verify=verify)
+        ct = resp.headers.get('Content-Type', '')
+        ok = (
+            resp.status_code == 200
+            and len(resp.content) > 22
+            and ('zip' in ct or 'octet-stream' in ct or resp.content[:2] == b'PK')
+        )
+        return {
+            'ok': ok,
+            'status': resp.status_code,
+            'bytes': len(resp.content),
+            'content_type': ct,
+        }
+    except Exception as e:
+        return {'ok': False, 'error': str(e)}
 
 
 def save_config(config: dict) -> None:
@@ -545,7 +611,7 @@ def _ensure_rcon(world_dir: Path) -> None:
         props_file.write_text('\n'.join(new_lines) + '\n')
 
 
-def rebuild_paintings(world_dir: Path) -> None:
+def rebuild_paintings(world_dir: Path) -> dict:
     """Full pipeline: data pack → resource pack zip → server.properties for one world."""
     paintings_dir = _paintings_dir(world_dir)
 
@@ -561,17 +627,32 @@ def rebuild_paintings(world_dir: Path) -> None:
     host = config.get('server_host', '').strip()
     if not host:
         host = get_local_ip()
+    pack_info: dict = {'url': '', 'sha1': sha1, 'image_count': 0}
+    if paintings_dir.exists():
+        pack_info['image_count'] = sum(1 for f in paintings_dir.iterdir() if _is_image_file(f))
     if host:
-        url = f'http://{host}:{_public_port()}/resourcepack/{world_dir.name}'
+        url = _resource_pack_url(world_dir.name, host)
         _update_server_properties(world_dir, {
             'resource-pack': url,
             'resource-pack-sha1': sha1,
             'server-port': str(_mc_internal_port()),
         })
+        loopback = _resource_pack_url(world_dir.name, '127.0.0.1').replace('https://', 'http://')
+        pack_info.update({
+            'url': url,
+            'scheme': _resource_pack_scheme(host),
+            'test': _test_resource_pack_url(loopback),
+        })
+        if not pack_info['test'].get('ok'):
+            app.logger.warning(
+                'Resource pack self-test failed for %s: %s',
+                world_dir.name, pack_info['test'],
+            )
     else:
         _ensure_mc_internal_port(world_dir)
 
     _ensure_rcon(world_dir)
+    return pack_info
 
 
 def rebuild_paintings_all() -> int:
@@ -741,8 +822,8 @@ def rebuild_paintings_endpoint(name):
     if not world_dir.is_dir():
         return jsonify({'error': 'World not found'}), 404
     try:
-        rebuild_paintings(world_dir)
-        return jsonify({'ok': True})
+        pack_info = rebuild_paintings(world_dir)
+        return jsonify({'ok': True, 'pack': pack_info})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -1131,22 +1212,48 @@ def rcon_exec_endpoint(name):
 
 # ─── Resource pack ───────────────────────────────────────────────────────────
 
-@app.route('/resourcepack/<name>')
+@app.route('/resourcepack/<path:name>')
 def serve_resource_pack(name):
+    if name.endswith('.zip'):
+        name = name[:-4]
     try:
         world_dir = safe_child(WORLDS_DIR, name)
     except ValueError:
         return 'Not found', 404
     if not world_dir.is_dir():
         return 'Not found', 404
+    return _pack_file_response(world_dir)
+
+
+@app.route('/api/worlds/<name>/resource-pack-info', methods=['GET'])
+@require_auth
+def resource_pack_info(name):
+    world_dir = safe_child(WORLDS_DIR, name)
+    if not world_dir.is_dir():
+        return jsonify({'error': 'World not found'}), 404
+    props = world_dir / 'server.properties'
+    url = sha1 = ''
+    if props.exists():
+        for line in props.read_text().splitlines():
+            if line.startswith('resource-pack='):
+                url = line.split('=', 1)[1].strip()
+            elif line.startswith('resource-pack-sha1='):
+                sha1 = line.split('=', 1)[1].strip()
+    config = load_config()
+    host = config.get('server_host', '').strip() or get_local_ip()
+    loopback = _resource_pack_url(name, '127.0.0.1').replace('https://', 'http://')
     cached = world_dir / '.resource_pack.zip'
-    if cached.exists():
-        return send_file(cached, mimetype='application/zip',
-                         as_attachment=True, download_name=f'{name}_paintings.zip')
-    # Generate on the fly if cache is missing
-    data = _build_resource_pack_zip(_paintings_dir(world_dir))
-    return send_file(io.BytesIO(data), mimetype='application/zip',
-                     as_attachment=True, download_name=f'{name}_paintings.zip')
+    return jsonify({
+        'url': url,
+        'sha1': sha1,
+        'expected_url': _resource_pack_url(name, host) if host else '',
+        'scheme': _resource_pack_scheme(host) if host else '',
+        'cached_bytes': cached.stat().st_size if cached.exists() else 0,
+        'image_count': sum(1 for f in _paintings_dir(world_dir).iterdir() if _is_image_file(f))
+            if _paintings_dir(world_dir).exists() else 0,
+        'local_test': _test_resource_pack_url(loopback),
+        'curl_test': f'curl -I {loopback}',
+    })
 
 
 # ─── Config ───────────────────────────────────────────────────────────────────
@@ -1370,18 +1477,29 @@ if __name__ == '__main__':
     cfg = load_config()
     public = _public_port()
     internal = _mc_internal_port()
-    start_port_proxy(
-        public_port=public,
-        mc_port=internal,
-        http_host=FLASK_HOST,
-        http_port=FLASK_PORT,
-    )
+    host = cfg.get('server_host', '').strip()
+    tls_ctx = None
+    if cfg.get('resource_pack_https') and host and not _is_private_host(host):
+        try:
+            tls_ctx = ensure_tls_context(BASE_DIR / '.certs', host)
+            print(f'TLS enabled for resource packs (host: {host})')
+        except Exception as e:
+            print(f'Warning: TLS cert generation failed ({e}) — HTTPS packs may not work')
     if public in (FLASK_PORT, internal):
         raise SystemExit(
             f'Config error: public_port ({public}) conflicts with internal ports. '
             f'Use {DEFAULT_PUBLIC_PORT} for players and delete config.json to reset.'
         )
+    start_port_proxy(
+        public_port=public,
+        mc_port=internal,
+        http_host=FLASK_HOST,
+        http_port=FLASK_PORT,
+        ssl_context=tls_ctx,
+    )
     print(f'Public port {public}: Minecraft + resource packs + web UI')
     print(f'Minecraft binds internally on port {internal}')
     print(f'Flask (internal): {FLASK_HOST}:{FLASK_PORT}')
-    app.run(host=FLASK_HOST, port=FLASK_PORT, debug=False)
+    if host:
+        print(f'Resource packs: {_resource_pack_scheme(host)}://{host}:{public}/resourcepack/<world>.zip')
+    app.run(host=FLASK_HOST, port=FLASK_PORT, debug=False, threaded=True)

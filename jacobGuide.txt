@@ -1,4 +1,4 @@
 MC_PASSWORD="password" SERVER_NAME="server_name" ./webapp/run.sh
 
-ssh -L 8080:localhost:5000 dorian@108.46.133.187 -p 2222
+ssh -L 8080:localhost:25565 dorian@108.46.133.187 -p 2222
     (opens at localhost:8080)

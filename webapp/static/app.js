@@ -242,10 +242,23 @@ async function rebuildPaintingsForWorld(name) {
   const status = document.getElementById('imageUploadStatus');
   if (btn) { btn.disabled = true; btn.textContent = 'Applying…'; }
   try {
-    await apiJson('POST', `/api/worlds/${encodeURIComponent(name)}/rebuild-paintings`);
+    const data = await apiJson('POST', `/api/worlds/${encodeURIComponent(name)}/rebuild-paintings`);
     if (status) {
-      status.textContent = 'Applied to world — restart the server for changes to take effect.';
-      status.className = 'status-text ok';
+      const pack = data.pack || {};
+      let msg = 'Applied to world — restart the server for changes to take effect.';
+      if (pack.url) {
+        msg += `\nPack URL: ${pack.url}`;
+        if (pack.image_count === 0) {
+          msg += '\n⚠ No images uploaded yet — pack is empty.';
+        }
+        if (pack.test && !pack.test.ok) {
+          msg += `\n⚠ Server self-test failed: ${pack.test.error || 'HTTP ' + (pack.test.status || '?')}`;
+          msg += '\nRun from another network: curl -I ' + pack.url;
+        }
+      }
+      status.textContent = msg;
+      status.className = 'status-text ' + (pack.test && !pack.test.ok ? 'err' : 'ok');
+      status.style.whiteSpace = 'pre-wrap';
     }
   } catch (err) {
     if (status) {

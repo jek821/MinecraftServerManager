@@ -1,14 +1,15 @@
-"""TCP multiplexer: route port 25565 to Minecraft (internal) or Flask (HTTP).
+"""TCP multiplexer: route port 25565 to Minecraft (internal) or Flask (HTTP/HTTPS).
 
-Players connect to :25565 for the game. Minecraft clients also download resource
-packs over HTTP on the same host:port, so HTTP requests on the public port are
-forwarded to the local Flask app while everything else goes to the MC server.
+Players connect to :25565 for the game. Minecraft clients download resource packs
+over HTTP(S) on the same host:port, so those requests are forwarded to Flask while
+game traffic goes to the internal MC server port.
 """
 
 from __future__ import annotations
 
 import select
 import socket
+import ssl
 import threading
 
 _HTTP_PREFIXES = (
@@ -21,6 +22,14 @@ def _is_http(sock: socket.socket) -> bool:
     try:
         peek = sock.recv(8, socket.MSG_PEEK)
         return any(peek.startswith(p) for p in _HTTP_PREFIXES)
+    except OSError:
+        return False
+
+
+def _is_tls(sock: socket.socket) -> bool:
+    try:
+        peek = sock.recv(3, socket.MSG_PEEK)
+        return len(peek) >= 3 and peek[0] == 0x16 and peek[1] == 0x03
     except OSError:
         return False
 
@@ -60,15 +69,24 @@ def _handle_client(
     mc_port: int,
     http_host: str,
     http_port: int,
+    ssl_context: ssl.SSLContext | None,
 ) -> None:
     try:
-        if _is_http(client):
-            backend = socket.create_connection((http_host, http_port), timeout=10)
+        if ssl_context and _is_tls(client):
+            tls_client = ssl_context.wrap_socket(client, server_side=True)
+            backend = socket.create_connection((http_host, http_port), timeout=15)
+            _relay(tls_client, backend)
+        elif _is_http(client):
+            backend = socket.create_connection((http_host, http_port), timeout=15)
+            _relay(client, backend)
         else:
-            backend = socket.create_connection((mc_host, mc_port), timeout=10)
-        _relay(client, backend)
+            backend = socket.create_connection((mc_host, mc_port), timeout=15)
+            _relay(client, backend)
     except OSError:
-        client.close()
+        try:
+            client.close()
+        except OSError:
+            pass
 
 
 def _listen_loop(
@@ -78,6 +96,7 @@ def _listen_loop(
     mc_port: int,
     http_host: str,
     http_port: int,
+    ssl_context: ssl.SSLContext | None,
 ) -> None:
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -87,7 +106,7 @@ def _listen_loop(
         client, _addr = listener.accept()
         threading.Thread(
             target=_handle_client,
-            args=(client, mc_host, mc_port, http_host, http_port),
+            args=(client, mc_host, mc_port, http_host, http_port, ssl_context),
             daemon=True,
         ).start()
 
@@ -98,10 +117,11 @@ def start_port_proxy(
     http_host: str = '127.0.0.1',
     http_port: int = 5000,
     public_host: str = '0.0.0.0',
+    ssl_context: ssl.SSLContext | None = None,
 ) -> threading.Thread:
     thread = threading.Thread(
         target=_listen_loop,
-        args=(public_host, public_port, '127.0.0.1', mc_port, http_host, http_port),
+        args=(public_host, public_port, '127.0.0.1', mc_port, http_host, http_port, ssl_context),
         daemon=True,
         name='port-proxy',
     )

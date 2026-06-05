@@ -10,6 +10,9 @@ jars/
 # Runtime config (contains local IP)
 config.json
 
+# Auto-generated TLS certs for optional HTTPS resource packs
+.certs/
+
 # Flask secret key (generated at runtime)
 .secret_key
 webapp/.secret_key
