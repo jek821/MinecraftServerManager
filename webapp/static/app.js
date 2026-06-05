@@ -10,6 +10,7 @@ let _serverHost = '';
 let _giveWorld = null;
 let _selectedPlayer = null;
 let _selectedPainting = null;
+let _activeWorld = null;
 
 // ── API helper ────────────────────────────────────────────────────────────────
 async function api(method, path, body) {
@@ -30,6 +31,16 @@ async function apiJson(method, path, body) {
 }
 
 // ── Formatting ────────────────────────────────────────────────────────────────
+function fmtUptime(seconds) {
+  if (seconds == null) return '—';
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+
 function fmtBytes(b) {
   if (b < 1024) return b + ' B';
   if (b < 1024 ** 2) return (b / 1024).toFixed(1) + ' KB';
@@ -98,7 +109,6 @@ function buildWorldCard(w) {
       <button class="btn btn-secondary" data-action="download" data-world="${esc(w.name)}">Download</button>
       ${w.has_properties ? `<button class="btn btn-secondary" data-action="properties" data-world="${esc(w.name)}">Properties</button>` : ''}
       <button class="btn btn-secondary" data-action="images" data-world="${esc(w.name)}">Images</button>
-      <button class="btn btn-secondary" data-action="give"     data-world="${esc(w.name)}">Give Painting</button>
       <button class="btn btn-danger"    data-action="delete"  data-world="${esc(w.name)}">Delete</button>
     </div>
   `;
@@ -120,7 +130,6 @@ document.getElementById('worldsGrid').addEventListener('click', async (e) => {
   if (action === 'download')    downloadWorld(name);
   if (action === 'properties')  await openProperties(name);
   if (action === 'images')      await openImages(name);
-  if (action === 'give')        await openGive(name);
   if (action === 'delete')      openDeleteConfirm(name);
 });
 
@@ -420,7 +429,18 @@ async function fetchPlayers() {
       updateGiveBtn();
     }, 'No players online.');
   } catch (err) {
-    list.innerHTML = `<div class="give-msg err">${esc(err.message)}</div>`;
+    const isRconErr = /rcon|enable-rcon/i.test(err.message);
+    if (isRconErr) {
+      list.innerHTML = '<div class="give-msg">RCON not configured — enabling automatically…</div>';
+      try {
+        await apiJson('POST', `/api/worlds/${encodeURIComponent(_giveWorld)}/ensure-rcon`);
+        list.innerHTML = '<div class="give-msg">RCON enabled in server.properties. Restart the server to apply, then re-open Give Painting.</div>';
+      } catch (fixErr) {
+        list.innerHTML = `<div class="give-msg err">Auto-fix failed: ${esc(fixErr.message)}</div>`;
+      }
+    } else {
+      list.innerHTML = `<div class="give-msg err">${esc(err.message)}</div>`;
+    }
   }
 }
 
@@ -533,7 +553,228 @@ document.getElementById('logoutBtn').addEventListener('click', async () => {
   location.reload();
 });
 
+// ── Server HUD ────────────────────────────────────────────────────────────────
+async function loadServerStatus() {
+  try {
+    const data = await apiJson('GET', '/api/server/status');
+    updateServerHud(data);
+  } catch { /* silent */ }
+}
+
+function updateServerHud(data) {
+  const dot           = document.getElementById('serverStatusDot');
+  const label         = document.getElementById('serverStatusText');
+  const startBtn      = document.getElementById('startServerBtn');
+  const stopBtn       = document.getElementById('stopServerBtn');
+  const giveHudBtn    = document.getElementById('givePaintingHudBtn');
+
+  _activeWorld = data.world || null;
+
+  dot.className = 'server-status-dot ' + data.state;
+
+  const stateLabel = { running: 'RUNNING', starting: 'STARTING', stopped: 'STOPPED' }[data.state] || data.state.toUpperCase();
+  label.textContent = data.world ? `${stateLabel} — ${data.world}` : stateLabel;
+
+  startBtn.disabled   = data.state !== 'stopped';
+  stopBtn.disabled    = data.state === 'stopped';
+  giveHudBtn.disabled = data.state !== 'running';
+  document.getElementById('manageOpsHudBtn').disabled = data.state !== 'running';
+
+  document.getElementById('statPlayers').textContent =
+    data.players_online != null ? `${data.players_online} / ${data.players_max}` : '—';
+  document.getElementById('statUptime').textContent  = fmtUptime(data.uptime);
+  document.getElementById('statVersion').textContent = data.version || '—';
+  document.getElementById('statPort').textContent    = data.mc_port || '—';
+
+  const m = data.metrics;
+  document.getElementById('statJvmRam').textContent = m ? fmtBytes(m.rss_kb * 1024) : '—';
+  document.getElementById('statSysRam').textContent = m
+    ? `${fmtBytes(m.sys_mem_used_kb * 1024)} / ${fmtBytes(m.sys_mem_total_kb * 1024)}`
+    : '—';
+  document.getElementById('statCpu').textContent = m != null ? m.cpu_pct + '%' : '—';
+}
+
+document.getElementById('startServerBtn').addEventListener('click', async () => {
+  const btn = document.getElementById('startServerBtn');
+  btn.disabled = true;
+  btn.textContent = 'Starting…';
+  try {
+    await apiJson('POST', '/api/server/start');
+  } catch (err) {
+    alert('Error: ' + err.message);
+    btn.textContent = '▶ Start';
+    btn.disabled = false;
+  }
+  await loadServerStatus();
+});
+
+document.getElementById('stopServerBtn').addEventListener('click', async () => {
+  const btn = document.getElementById('stopServerBtn');
+  btn.disabled = true;
+  btn.textContent = 'Stopping…';
+  try {
+    await apiJson('POST', '/api/server/stop');
+  } catch (err) {
+    alert('Error: ' + err.message);
+  }
+  btn.textContent = '■ Stop';
+  await loadServerStatus();
+});
+
+document.getElementById('givePaintingHudBtn').addEventListener('click', async () => {
+  if (!_activeWorld) return;
+  await openGive(_activeWorld);
+});
+
+// ── Ops Modal ─────────────────────────────────────────────────────────────────
+let _opsWorld = null;
+
+async function openOps(name) {
+  _opsWorld = name;
+  document.getElementById('opsModalTitle').textContent = `Manage Ops — ${name}`;
+  document.getElementById('opsStatus').classList.add('hidden');
+  document.getElementById('opByNameInput').value = '';
+  openModal('opsModal');
+  await Promise.all([fetchOpsPlayers(), fetchCurrentOps()]);
+}
+
+async function fetchOpsPlayers() {
+  const list = document.getElementById('opsPlayersList');
+  list.innerHTML = '<div class="give-msg">Connecting…</div>';
+  try {
+    const [pd, od] = await Promise.all([
+      apiJson('GET', `/api/worlds/${encodeURIComponent(_opsWorld)}/rcon/players`),
+      apiJson('GET', `/api/worlds/${encodeURIComponent(_opsWorld)}/ops`),
+    ]);
+    const opNames = new Set((od || []).map(o => o.name.toLowerCase()));
+    const players = pd.players || [];
+    if (!players.length) {
+      list.innerHTML = '<div class="give-msg">No players online.</div>';
+      return;
+    }
+    list.innerHTML = players.map(p => `
+      <div class="ops-player-row">
+        <span class="ops-player-name">${esc(p)}</span>
+        ${opNames.has(p.toLowerCase())
+          ? '<span class="ops-badge">OP</span>'
+          : `<button class="btn btn-active btn-sm" data-op="${esc(p)}">Op</button>`}
+      </div>
+    `).join('');
+    list.querySelectorAll('[data-op]').forEach(btn =>
+      btn.addEventListener('click', () => opPlayer(btn.dataset.op))
+    );
+  } catch (err) {
+    list.innerHTML = `<div class="give-msg err">${esc(err.message)}</div>`;
+  }
+}
+
+async function fetchCurrentOps() {
+  const list = document.getElementById('currentOpsList');
+  list.innerHTML = '<div class="give-msg">Loading…</div>';
+  try {
+    const ops = await apiJson('GET', `/api/worlds/${encodeURIComponent(_opsWorld)}/ops`);
+    if (!ops.length) {
+      list.innerHTML = '<div class="give-msg">No ops configured.</div>';
+      return;
+    }
+    list.innerHTML = ops.map(op => `
+      <div class="ops-player-row">
+        <span class="ops-player-name">${esc(op.name)}</span>
+        <button class="btn btn-danger btn-sm" data-deop="${esc(op.name)}">Deop</button>
+      </div>
+    `).join('');
+    list.querySelectorAll('[data-deop]').forEach(btn =>
+      btn.addEventListener('click', () => deopPlayer(btn.dataset.deop))
+    );
+  } catch (err) {
+    list.innerHTML = `<div class="give-msg err">${esc(err.message)}</div>`;
+  }
+}
+
+async function opPlayer(player) {
+  try {
+    const data = await apiJson('POST', `/api/worlds/${encodeURIComponent(_opsWorld)}/rcon/op`, { player });
+    showOpsStatus('✔ ' + (data.response || `${player} opped`), 'ok');
+    await Promise.all([fetchOpsPlayers(), fetchCurrentOps()]);
+  } catch (err) {
+    showOpsStatus('✘ ' + err.message, 'err');
+  }
+}
+
+async function deopPlayer(player) {
+  try {
+    const data = await apiJson('POST', `/api/worlds/${encodeURIComponent(_opsWorld)}/rcon/deop`, { player });
+    showOpsStatus('✔ ' + (data.response || `${player} deopped`), 'ok');
+    await Promise.all([fetchOpsPlayers(), fetchCurrentOps()]);
+  } catch (err) {
+    showOpsStatus('✘ ' + err.message, 'err');
+  }
+}
+
+function showOpsStatus(msg, type) {
+  const el = document.getElementById('opsStatus');
+  el.textContent = msg;
+  el.className = 'give-status ' + type;
+  el.classList.remove('hidden');
+}
+
+document.getElementById('refreshOpsPlayersBtn').addEventListener('click', fetchOpsPlayers);
+document.getElementById('refreshOpsListBtn').addEventListener('click', fetchCurrentOps);
+
+document.getElementById('opByNameBtn').addEventListener('click', async () => {
+  const input = document.getElementById('opByNameInput');
+  const player = input.value.trim();
+  if (!player) return;
+  input.value = '';
+  await opPlayer(player);
+});
+
+document.getElementById('opByNameInput').addEventListener('keydown', e => {
+  if (e.key === 'Enter') document.getElementById('opByNameBtn').click();
+});
+
+document.getElementById('manageOpsHudBtn').addEventListener('click', async () => {
+  if (!_activeWorld) return;
+  await openOps(_activeWorld);
+});
+
+setInterval(loadServerStatus, 5000);
+
+// ── RCON Console ──────────────────────────────────────────────────────────────
+document.getElementById('rconSendBtn').addEventListener('click', sendRconCommand);
+document.getElementById('rconCmdInput').addEventListener('keydown', e => {
+  if (e.key === 'Enter') sendRconCommand();
+});
+
+async function sendRconCommand() {
+  if (!_activeWorld) return;
+  const input = document.getElementById('rconCmdInput');
+  const output = document.getElementById('rconOutput');
+  const cmd = input.value.trim();
+  if (!cmd) return;
+  output.textContent = 'Sending…';
+  output.classList.remove('hidden');
+  try {
+    const data = await apiJson('POST', `/api/worlds/${encodeURIComponent(_activeWorld)}/rcon/exec`, { command: cmd });
+    output.textContent = data.response || '(empty response)';
+  } catch (err) {
+    output.textContent = 'Error: ' + err.message;
+  }
+}
+
+// ── Collapsible sections ───────────────────────────────────────────────────────
+document.querySelectorAll('.collapsible-header').forEach(header => {
+  header.addEventListener('click', () => {
+    const bodyId = header.dataset.toggle;
+    const body = document.getElementById(bodyId);
+    const arrow = header.querySelector('.collapse-arrow');
+    const collapsed = body.classList.toggle('hidden');
+    if (arrow) arrow.textContent = collapsed ? '▸' : '▾';
+  });
+});
+
 // ── Init ──────────────────────────────────────────────────────────────────────
 loadSettings();
 loadWorlds();
 loadJars();
+loadServerStatus();

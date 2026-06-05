@@ -1,15 +1,30 @@
 # World data (large binary files)
 worldFiles/
 
+# Global painting images (tracked — shared across all worlds/servers)
+# paintings/
+
 # Server jars
 jars/
 
 # Runtime config (contains local IP)
 config.json
 
+# Flask secret key (generated at runtime)
+.secret_key
+webapp/.secret_key
+
+# Minecraft server unpacked files
+webapp/libraries/
+webapp/versions/
+libraries/
+versions/
+
+# Logs
+webapp/logs/
+logs/
+
 # Python
-webapp/__pycache__/
-webapp/*.pyc
 **/__pycache__/
 *.pyc
 *.pyo

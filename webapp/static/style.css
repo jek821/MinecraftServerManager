@@ -552,6 +552,181 @@ main {
 
 .btn-sm { padding: 0.25rem 0.5rem; font-size: 0.72rem; }
 
+/* ── Server HUD ───────────────────────────────────────────────────────────── */
+.server-actions { display: flex; gap: 0.5rem; }
+
+.server-status-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-bottom: 0.9rem;
+}
+
+.server-status-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--text-muted);
+}
+.server-status-dot.running {
+  background: var(--accent);
+  box-shadow: 0 0 6px var(--accent);
+}
+.server-status-dot.starting {
+  background: #fbbf24;
+  box-shadow: 0 0 6px #fbbf24;
+  animation: pulse-dot 1s ease-in-out infinite;
+}
+.server-status-dot.stopped { background: var(--danger); }
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.4; }
+}
+
+.server-status-label { font-size: 0.875rem; font-weight: 600; }
+
+.server-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.65rem;
+}
+
+.stat-tile {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.55rem 0.9rem;
+  min-width: 110px;
+}
+
+.stat-tile-wide { flex: 1; min-width: 180px; }
+
+.stat-label {
+  font-size: 0.65rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-weight: 600;
+  margin-bottom: 0.2rem;
+}
+
+.stat-value { font-size: 0.9rem; font-weight: 600; }
+
+/* ── Collapsible sections ─────────────────────────────────────────────────── */
+.collapsible-header {
+  cursor: pointer;
+  user-select: none;
+}
+.collapsible-header:hover h2 { color: var(--accent); }
+
+.collapse-arrow {
+  font-size: 0.9rem;
+  color: var(--text-muted);
+  transition: transform 0.15s;
+}
+
+.collapsible-body { padding-top: 0.25rem; }
+
+/* ── Ops Modal ────────────────────────────────────────────────────────────── */
+.ops-player-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.3rem 0.75rem;
+  border-radius: 6px;
+}
+.ops-player-row:hover { background: var(--surface2); }
+
+.ops-player-name { font-size: 0.875rem; flex: 1; word-break: break-all; }
+
+.ops-badge {
+  background: var(--accent-dim);
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  font-size: 0.65rem;
+  font-weight: 700;
+  padding: 0.1rem 0.35rem;
+  flex-shrink: 0;
+}
+
+.ops-byname {
+  display: flex;
+  gap: 0.5rem;
+  padding: 0.75rem 1.25rem;
+  border-top: 1px solid var(--border);
+}
+
+.ops-byname input {
+  flex: 1;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-size: 0.875rem;
+  padding: 0.45rem 0.75rem;
+  outline: none;
+}
+.ops-byname input:focus { border-color: var(--accent); }
+
+/* ── RCON Console ─────────────────────────────────────────────────────────── */
+.rcon-console {
+  margin-top: 1rem;
+  border-top: 1px solid var(--border);
+  padding-top: 0.5rem;
+}
+
+.rcon-console-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.4rem 0;
+  cursor: pointer;
+  user-select: none;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.rcon-console-header:hover { color: var(--text); }
+
+.rcon-input-row {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+
+.rcon-cmd-input {
+  flex: 1;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-size: 0.875rem;
+  font-family: monospace;
+  padding: 0.45rem 0.75rem;
+  outline: none;
+}
+.rcon-cmd-input:focus { border-color: var(--accent); }
+
+.rcon-output {
+  margin-top: 0.5rem;
+  background: #0a0c10;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: #a3e635;
+  font-family: monospace;
+  font-size: 0.8rem;
+  padding: 0.6rem 0.75rem;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
 /* ── Responsive ───────────────────────────────────────────────────────────── */
 @media (max-width: 600px) {
   main { padding: 1rem; }
