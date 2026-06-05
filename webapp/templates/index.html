@@ -136,12 +136,12 @@
           <div class="setting-row">
             <div class="setting-label">
               <span>Server Host</span>
-              <span class="setting-hint">LAN IP of this machine — used to build the resource-pack URL pushed to players</span>
+              <span class="setting-hint">IP or hostname players use to connect. Resource packs are served on the same port (25565).</span>
             </div>
             <div class="setting-control">
               <div class="input-row">
                 <input type="text" id="serverHost" placeholder="e.g. 192.168.1.100" />
-                <input type="number" id="serverPort" placeholder="5000" min="1" max="65535" style="width:90px" />
+                <span class="setting-hint" style="white-space:nowrap">:25565</span>
                 <button class="btn btn-secondary" id="autoDetectBtn">Auto-detect</button>
               </div>
             </div>
@@ -190,11 +190,12 @@
         <button class="modal-close" data-close="imagesModal">✕</button>
       </div>
       <div id="imagesHostWarning" class="images-host-warning hidden">
-        ⚠ Server Host isn't set — resource-pack URL won't be written to server.properties.
+        ⚠ Server Host isn't set — a LAN IP will be auto-detected, which won't work for remote players.
         <a href="#" id="imagesHostLink">Set it in Settings.</a>
       </div>
       <div class="images-hint">
-        Images should be multiples of 16 px per block (e.g. 32×32 = 2×2 blocks).
+        Images are stored locally inside this world only — upload them on each machine.
+        Use multiples of 16 px per block (e.g. 32×32 = 2×2 blocks).
         After uploading, restart the server for the resource pack to take effect.
       </div>
       <div id="imagesList" class="images-list"></div>

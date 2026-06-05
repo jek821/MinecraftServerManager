@@ -15,8 +15,8 @@ export SERVER_NAME="${SERVER_NAME:-MC}"
 # SECRET_KEY is persisted to .secret_key file by app.py — no need to generate here
 
 LOCAL_IP=$(.venv/bin/python3 -c "import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.connect(('8.8.8.8',80)); print(s.getsockname()[0]); s.close()" 2>/dev/null || echo "localhost")
-echo "Minecraft Server Manager running at:"
-echo "  Local:   http://localhost:5000"
-echo "  Network: http://$LOCAL_IP:5000"
+echo "Minecraft Server Manager — open port 25565 only:"
+echo "  Web UI:    http://$LOCAL_IP:25565"
+echo "  Minecraft: $LOCAL_IP:25565"
 
 exec .venv/bin/python app.py

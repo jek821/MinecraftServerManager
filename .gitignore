@@ -1,8 +1,8 @@
 # World data (large binary files)
 worldFiles/
 
-# Global painting images (tracked — shared across all worlds/servers)
-# paintings/
+# Legacy root paintings folder (images now live inside worldFiles/<world>/paintings/)
+paintings/
 
 # Server jars
 jars/

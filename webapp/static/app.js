@@ -48,6 +48,10 @@ function fmtBytes(b) {
   return (b / 1024 ** 3).toFixed(2) + ' GB';
 }
 
+function paintingStem(filename) {
+  return filename.replace(/\.[^.]+$/, '').toLowerCase().replace(/[\s.-]/g, '_');
+}
+
 function fmtDate(iso) {
   return new Date(iso).toLocaleString(undefined, {
     month: 'short', day: 'numeric', year: 'numeric',
@@ -235,10 +239,20 @@ async function openImages(name) {
 
 async function rebuildPaintingsForWorld(name) {
   const btn = document.getElementById('applyPaintingsBtn');
+  const status = document.getElementById('imageUploadStatus');
   if (btn) { btn.disabled = true; btn.textContent = 'Applying…'; }
   try {
     await apiJson('POST', `/api/worlds/${encodeURIComponent(name)}/rebuild-paintings`);
-  } catch (_) { /* silent — non-critical */ }
+    if (status) {
+      status.textContent = 'Applied to world — restart the server for changes to take effect.';
+      status.className = 'status-text ok';
+    }
+  } catch (err) {
+    if (status) {
+      status.textContent = 'Apply failed: ' + err.message;
+      status.className = 'status-text err';
+    }
+  }
   if (btn) { btn.disabled = false; btn.textContent = 'Apply to World'; }
 }
 
@@ -536,7 +550,7 @@ async function fetchPaintingsForGive() {
     const images = await apiJson('GET', `/api/worlds/${encodeURIComponent(_giveWorld)}/images`);
     const items = images.map(img => ({
       label: img.name,
-      value: img.name.replace(/\.[^.]+$/, '').toLowerCase().replace(/[\s-]/g, '_'),
+      value: paintingStem(img.name),
     }));
     renderSelectList(list, items, 'painting', (val) => {
       _selectedPainting = val;
@@ -594,7 +608,6 @@ async function loadSettings() {
   try {
     const cfg = await apiJson('GET', '/api/config');
     _serverHost = cfg.server_host || '';
-    document.getElementById('serverPort').value = cfg.port || 5000;
     document.getElementById('jvmArgs').value = cfg.jvm_args || '';
     if (_serverHost) {
       document.getElementById('serverHost').value = _serverHost;
@@ -617,16 +630,18 @@ document.getElementById('autoDetectBtn').addEventListener('click', async () => {
 
 document.getElementById('saveSettingsBtn').addEventListener('click', async () => {
   const host = document.getElementById('serverHost').value.trim();
-  const port = document.getElementById('serverPort').value.trim() || '5000';
   const jvmArgs = document.getElementById('jvmArgs').value.trim();
   const statusEl = document.getElementById('settingsStatus');
   try {
-    await apiJson('POST', '/api/config', { server_host: host, port: parseInt(port, 10), jvm_args: jvmArgs });
+    const data = await apiJson('POST', '/api/config', { server_host: host, public_port: 25565, jvm_args: jvmArgs });
     _serverHost = host;
-    statusEl.textContent = '✔ Saved';
+    const rebuilt = data.rebuilt_worlds || 0;
+    statusEl.textContent = rebuilt
+      ? `✔ Saved — resource-pack URLs updated for ${rebuilt} world(s)`
+      : '✔ Saved';
     statusEl.className = 'status-text ok';
     statusEl.classList.remove('hidden');
-    setTimeout(() => statusEl.classList.add('hidden'), 2500);
+    setTimeout(() => statusEl.classList.add('hidden'), 4000);
   } catch (err) {
     statusEl.textContent = '✘ ' + err.message;
     statusEl.className = 'status-text err';
