@@ -1501,7 +1501,7 @@ def _stop_background_mc(
         log('Stopping pre-generation…')
     if cfg and cfg.get('enabled') and cfg.get('password'):
         try:
-            _rcon_exec('localhost', cfg['port'], cfg['password'], 'chunky cancel')
+            _chunky_rcon(cfg, 'chunky cancel')
         except RCONError:
             pass
         try:
@@ -1537,6 +1537,35 @@ def _pregen_sleep(seconds: int, job_id: str, cancel_event: threading.Event) -> b
             return True
         time.sleep(1)
     return cancel_event.is_set() or _job_cancel_requested(job_id)
+
+
+def _chunky_rcon(cfg: dict, cmd: str) -> tuple[str, str]:
+    """Run a Chunky RCON command; auto-send 'chunky confirm' when Chunky requires it."""
+    resp = _rcon_exec('localhost', cfg['port'], cfg['password'], cmd)
+    clean = re.sub(r'§.', '', resp).strip()
+    lower = clean.lower()
+    if 'confirm' in lower:
+        confirm_resp = _rcon_exec('localhost', cfg['port'], cfg['password'], 'chunky confirm')
+        confirm_clean = re.sub(r'§.', '', confirm_resp).strip()
+        if confirm_clean:
+            clean = f'{clean}\n{confirm_clean}'
+            lower = clean.lower()
+    return lower, clean
+
+
+def _chunky_reset_task(cfg: dict, log) -> None:
+    try:
+        lower, clean = _chunky_rcon(cfg, 'chunky cancel')
+        log(f'> chunky cancel')
+        if clean:
+            log(clean)
+    except RCONError:
+        pass
+
+
+def _chunky_progress_pct(output: str) -> float | None:
+    m = re.search(r'(\d+(?:\.\d+)?)\s*%', output)
+    return float(m.group(1)) if m else None
 
 
 def _run_pregen(job_id: str, world_name: str, center_x: int, center_z: int, radius: int):
@@ -1626,54 +1655,94 @@ def _run_pregen(job_id: str, world_name: str, center_x: int, center_z: int, radi
                 if not cfg['enabled'] or not cfg['password']:
                     raise RuntimeError('RCON not configured')
 
-                def rcon(cmd: str) -> str:
-                    resp = _rcon_exec('localhost', cfg['port'], cfg['password'], cmd)
-                    clean = re.sub(r'§.', '', resp).strip()
+                def rcon(cmd: str, *, chunky: bool = False) -> str:
+                    if chunky:
+                        lower, clean = _chunky_rcon(cfg, cmd)
+                    else:
+                        resp = _rcon_exec('localhost', cfg['port'], cfg['password'], cmd)
+                        clean = re.sub(r'§.', '', resp).strip()
+                        lower = clean.lower()
                     log(f'> {cmd}')
                     if clean:
                         log(clean)
-                    return clean.lower()
+                    return lower
 
-                try:
-                    rcon('chunky cancel')
-                except RCONError:
-                    pass
+                _chunky_reset_task(cfg, log)
 
+                start_out = ''
                 for cmd in (
                     f'chunky world {level}',
                     f'chunky center {center_x} {center_z}',
                     f'chunky radius {radius}',
-                    'chunky start',
                 ):
                     if cancel_event.is_set() or _job_cancel_requested(job_id):
                         cancelled = True
                         log('--- Cancelled ---')
                         break
                     out = rcon(cmd)
-                    if any(x in out for x in ('unknown command', 'not found', 'no such command', 'error')):
+                    if any(x in out for x in ('unknown command', 'not found', 'no such command')):
                         raise RuntimeError(
                             'Chunky command failed — install a Paper server jar from Update Server Version'
                         )
 
                 if not cancelled:
-                    log('--- Pre-generation running (this may take a while) ---')
-                    while True:
-                        if cancel_event.is_set() or _job_cancel_requested(job_id):
-                            cancelled = True
-                            log('--- Cancelled by user ---')
-                            break
-                        if _pregen_sleep(8, job_id, cancel_event):
-                            cancelled = True
-                            log('--- Cancelled by user ---')
-                            break
-                        try:
-                            out = rcon('chunky progress')
-                        except RCONError as e:
-                            log(f'RCON error: {e}')
-                            break
-                        if any(x in out for x in ('100%', '100.00%', 'no tasks', 'no task', 'finished', 'complete')):
-                            log('--- Pre-generation complete ---')
-                            break
+                    start_out = rcon('chunky start', chunky=True)
+                    if any(x in start_out for x in ('unknown command', 'not found', 'no such command')):
+                        raise RuntimeError(
+                            'Chunky command failed — install a Paper server jar from Update Server Version'
+                        )
+                    if 'already started' in start_out and 'confirm' not in start_out:
+                        start_out = rcon('chunky confirm', chunky=True)
+
+                if not cancelled:
+                    try:
+                        prog_out = rcon('chunky progress')
+                    except RCONError as e:
+                        raise RuntimeError(f'Could not read Chunky progress: {e}') from e
+
+                    if 'no task' in prog_out:
+                        raise RuntimeError(
+                            'Chunky did not start — a leftover task from a previous run blocked it. '
+                            'Run pre-gen again (the stale task has been cleared).'
+                        )
+
+                    pct = _chunky_progress_pct(prog_out)
+                    saw_progress = pct is not None
+                    if pct is not None and pct >= 100:
+                        log('--- Pre-generation complete ---')
+                    else:
+                        log('--- Pre-generation running (this may take a while) ---')
+                        while True:
+                            if cancel_event.is_set() or _job_cancel_requested(job_id):
+                                cancelled = True
+                                log('--- Cancelled by user ---')
+                                break
+                            if _pregen_sleep(8, job_id, cancel_event):
+                                cancelled = True
+                                log('--- Cancelled by user ---')
+                                break
+                            try:
+                                prog_out = rcon('chunky progress')
+                            except RCONError as e:
+                                log(f'RCON error: {e}')
+                                break
+                            pct = _chunky_progress_pct(prog_out)
+                            if pct is not None:
+                                saw_progress = True
+                                if pct >= 100:
+                                    log('--- Pre-generation complete ---')
+                                    break
+                            if 'no task' in prog_out:
+                                if saw_progress:
+                                    log('--- Pre-generation complete ---')
+                                else:
+                                    raise RuntimeError(
+                                        'Chunky reported no running task — generation did not start'
+                                    )
+                                break
+                            if any(x in prog_out for x in ('finished', 'complete')):
+                                log('--- Pre-generation complete ---')
+                                break
 
     except Exception as e:
         set_status('error', str(e))
