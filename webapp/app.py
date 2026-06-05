@@ -670,6 +670,71 @@ def delete_world(name):
     return jsonify({'ok': True})
 
 
+@app.route('/api/worlds/<name>/rename', methods=['POST'])
+@require_auth
+def rename_world(name):
+    world_dir = safe_child(WORLDS_DIR, name)
+    if not world_dir.is_dir():
+        return jsonify({'error': 'World not found'}), 404
+    data = request.get_json() or {}
+    new_name = data.get('new_name', '').strip()
+    if not valid_world_name(new_name):
+        return jsonify({'error': 'Invalid world name'}), 400
+    new_dir = WORLDS_DIR / new_name
+    if new_dir.exists():
+        return jsonify({'error': 'A world with that name already exists'}), 409
+    world_dir.rename(new_dir)
+    config = load_config()
+    if config.get('active_world') == name:
+        config['active_world'] = new_name
+        save_config(config)
+    return jsonify({'ok': True, 'new_name': new_name})
+
+
+@app.route('/api/worlds/upload', methods=['POST'])
+@require_auth
+def upload_world():
+    file = request.files.get('world')
+    if not file or not file.filename:
+        return jsonify({'error': 'No file provided'}), 400
+    if not file.filename.lower().endswith('.zip'):
+        return jsonify({'error': 'Only .zip files are supported'}), 400
+    world_name = Path(file.filename).stem
+    if not valid_world_name(world_name):
+        return jsonify({'error': 'Invalid world name (derived from filename)'}), 400
+    world_dir = WORLDS_DIR / world_name
+    if world_dir.exists():
+        return jsonify({'error': f'A world named "{world_name}" already exists'}), 409
+    try:
+        data = file.read()
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            # Detect whether the zip has a single top-level folder (common for world exports)
+            names = zf.namelist()
+            top = {n.split('/')[0] for n in names if n.strip('/')}
+            if len(top) == 1:
+                prefix = next(iter(top)) + '/'
+                world_dir.mkdir(parents=True)
+                for member in zf.infolist():
+                    rel = member.filename[len(prefix):]
+                    if not rel:
+                        continue
+                    dest = world_dir / rel
+                    if member.filename.endswith('/'):
+                        dest.mkdir(parents=True, exist_ok=True)
+                    else:
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        dest.write_bytes(zf.read(member.filename))
+            else:
+                world_dir.mkdir(parents=True)
+                zf.extractall(world_dir)
+        (world_dir / 'eula.txt').write_text('eula=true\n')
+        return jsonify({'ok': True, 'name': world_name})
+    except Exception as e:
+        if world_dir.exists():
+            shutil.rmtree(world_dir, ignore_errors=True)
+        return jsonify({'error': str(e)}), 500
+
+
 # ─── World Generation ─────────────────────────────────────────────────────────
 
 def _run_generate(job_id: str, new_name: str, inherit_properties: bool, old_active: str | None):

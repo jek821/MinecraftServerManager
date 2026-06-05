@@ -727,6 +727,23 @@ main {
   overflow-y: auto;
 }
 
+/* ── World rename ─────────────────────────────────────────────────────────── */
+.rename-btn { opacity: 0; transition: opacity .15s; padding: 0 .3rem; font-size: .85rem; }
+.world-card-header:hover .rename-btn { opacity: 1; }
+
+.rename-input {
+  flex: 1;
+  background: var(--bg);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-size: 1rem;
+  font-weight: 600;
+  padding: .15rem .4rem;
+  outline: none;
+  min-width: 0;
+}
+
 /* ── Responsive ───────────────────────────────────────────────────────────── */
 @media (max-width: 600px) {
   main { padding: 1rem; }

@@ -84,7 +84,11 @@
     <section class="section">
       <div class="section-header">
         <h2>World Saves</h2>
-        <button class="btn btn-primary" id="newWorldBtn">+ New World</button>
+        <div style="display:flex;gap:.5rem">
+          <label class="btn btn-secondary" for="uploadWorldInput">↑ Upload World</label>
+          <input type="file" id="uploadWorldInput" accept=".zip" style="display:none">
+          <button class="btn btn-primary" id="newWorldBtn">+ New World</button>
+        </div>
       </div>
       <div id="worldsGrid" class="worlds-grid">
         <div class="loading">Loading worlds…</div>

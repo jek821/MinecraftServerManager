@@ -97,8 +97,9 @@ function buildWorldCard(w) {
 
   card.innerHTML = `
     <div class="world-card-header">
-      <span class="world-name">${esc(w.name)}</span>
+      <span class="world-name" id="world-name-${esc(w.name)}">${esc(w.name)}</span>
       ${w.active ? '<span class="badge-active">ACTIVE</span>' : ''}
+      <button class="btn btn-ghost btn-sm rename-btn" data-action="rename" data-world="${esc(w.name)}" title="Rename">✎</button>
     </div>
     <div class="world-meta">
       <span>${fmtBytes(w.size)}</span>
@@ -131,7 +132,55 @@ document.getElementById('worldsGrid').addEventListener('click', async (e) => {
   if (action === 'properties')  await openProperties(name);
   if (action === 'images')      await openImages(name);
   if (action === 'delete')      openDeleteConfirm(name);
+  if (action === 'rename')      startRename(btn, name);
 });
+
+function startRename(btn, name) {
+  const header = btn.closest('.world-card-header');
+  const nameSpan = header.querySelector('.world-name');
+  if (header.querySelector('.rename-input')) return; // already open
+
+  btn.style.display = 'none';
+  const input = document.createElement('input');
+  input.className = 'rename-input';
+  input.value = name;
+  input.maxLength = 64;
+  const confirm = document.createElement('button');
+  confirm.className = 'btn btn-primary btn-sm';
+  confirm.textContent = '✓';
+  const cancel = document.createElement('button');
+  cancel.className = 'btn btn-ghost btn-sm';
+  cancel.textContent = '✕';
+
+  nameSpan.replaceWith(input);
+  btn.after(confirm, cancel);
+  input.select();
+
+  async function doRename() {
+    const newName = input.value.trim();
+    if (!newName || newName === name) { cancelRename(); return; }
+    confirm.disabled = cancel.disabled = true;
+    try {
+      await apiJson('POST', `/api/worlds/${encodeURIComponent(name)}/rename`, { new_name: newName });
+      await loadWorlds();
+    } catch (err) {
+      alert('Rename failed: ' + err.message);
+      cancelRename();
+    }
+  }
+  function cancelRename() {
+    input.replaceWith(nameSpan);
+    confirm.remove(); cancel.remove();
+    btn.style.display = '';
+  }
+
+  confirm.addEventListener('click', doRename);
+  cancel.addEventListener('click', cancelRename);
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter') doRename();
+    if (e.key === 'Escape') cancelRename();
+  });
+}
 
 async function activateWorld(name) {
   try {
@@ -275,6 +324,27 @@ document.getElementById('confirmDeleteBtn').addEventListener('click', async () =
 });
 
 // ── New World / Generate ──────────────────────────────────────────────────────
+document.getElementById('uploadWorldInput').addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  e.target.value = '';
+  const fd = new FormData();
+  fd.append('world', file);
+  const label = document.querySelector('label[for="uploadWorldInput"]');
+  const orig = label.textContent;
+  label.textContent = 'Uploading…';
+  try {
+    const res = await fetch('/api/worlds/upload', { method: 'POST', body: fd });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Upload failed');
+    await loadWorlds();
+  } catch (err) {
+    alert('Upload failed: ' + err.message);
+  } finally {
+    label.textContent = orig;
+  }
+});
+
 document.getElementById('newWorldBtn').addEventListener('click', () => {
   document.getElementById('newWorldName').value = '';
   document.getElementById('inheritProps').checked = true;
