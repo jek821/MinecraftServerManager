@@ -4,13 +4,68 @@
 let _propsWorld = null;
 let _imagesWorld = null;
 let _deleteWorld = null;
-let _generateJobId = null;
-let _generatePoll = null;
 let _serverHost = '';
 let _giveWorld = null;
 let _selectedPlayer = null;
 let _selectedPainting = null;
 let _activeWorld = null;
+
+const _locks = new Set();
+let _statusFetchInFlight = false;
+let _logsFetchInFlight = false;
+let _rebuildInFlight = false;
+let _propsOpenGen = 0;
+let _imagesOpenGen = 0;
+
+function withLock(key, fn) {
+  if (_locks.has(key)) return undefined;
+  _locks.add(key);
+  return Promise.resolve(fn()).finally(() => _locks.delete(key));
+}
+
+function setModalLocked(modalId, locked) {
+  const modal = document.getElementById(modalId);
+  if (!modal) return;
+  const closeBtn = modal.querySelector('.modal-close');
+  if (locked) {
+    modal.dataset.locked = '1';
+    if (closeBtn) closeBtn.style.display = 'none';
+  } else {
+    delete modal.dataset.locked;
+    if (closeBtn) closeBtn.style.display = '';
+  }
+}
+
+function startJobPoll(getPath, handlers) {
+  let lastLogLen = 0;
+  let stopped = false;
+  let timer = null;
+  const tick = async () => {
+    if (stopped) return;
+    try {
+      const job = await apiJson('GET', getPath);
+      if (stopped) return;
+      if (job.log && handlers.onLog) {
+        const newLines = job.log.slice(lastLogLen);
+        if (newLines.length) handlers.onLog(newLines);
+        lastLogLen = job.log.length;
+      }
+      if (job.status !== 'running') {
+        handlers.onDone(job);
+        return;
+      }
+    } catch (err) {
+      if (!stopped) handlers.onDone({ status: 'error', error: err.message });
+      return;
+    }
+    timer = setTimeout(tick, handlers.intervalMs || 1500);
+  };
+  tick();
+  return () => {
+    stopped = true;
+    if (timer) clearTimeout(timer);
+  };
+}
 
 // ── API helper ────────────────────────────────────────────────────────────────
 async function api(method, path, body) {
@@ -71,9 +126,13 @@ function closeModal(id) {
 // Close any modal when clicking the overlay background
 document.addEventListener('click', (e) => {
   if (e.target.classList.contains('modal-overlay')) {
+    if (e.target.dataset.locked) return;
     e.target.classList.add('hidden');
+    return;
   }
   if (e.target.dataset.close) {
+    const modal = document.getElementById(e.target.dataset.close);
+    if (modal?.dataset.locked) return;
     closeModal(e.target.dataset.close);
   }
 });
@@ -132,7 +191,15 @@ document.getElementById('worldsGrid').addEventListener('click', async (e) => {
   const action = btn.dataset.action;
   const name = btn.dataset.world;
 
-  if (action === 'activate')    await activateWorld(name);
+  if (action === 'activate') {
+    if (btn.disabled || _locks.has('activate')) return;
+    btn.disabled = true;
+    try {
+      await activateWorld(name);
+    } finally {
+      btn.disabled = false;
+    }
+  }
   if (action === 'download')    downloadWorld(name);
   if (action === 'properties')  await openProperties(name);
   if (action === 'images')      await openImages(name);
@@ -163,15 +230,19 @@ function startRename(btn, name) {
   input.select();
 
   async function doRename() {
+    if (_locks.has('rename')) return;
     const newName = input.value.trim();
     if (!newName || newName === name) { cancelRename(); return; }
     confirm.disabled = cancel.disabled = true;
+    _locks.add('rename');
     try {
       await apiJson('POST', `/api/worlds/${encodeURIComponent(name)}/rename`, { new_name: newName });
       await loadWorlds();
     } catch (err) {
       alert('Rename failed: ' + err.message);
       cancelRename();
+    } finally {
+      _locks.delete('rename');
     }
   }
   function cancelRename() {
@@ -189,13 +260,15 @@ function startRename(btn, name) {
 }
 
 async function activateWorld(name) {
-  try {
-    await apiJson('POST', `/api/worlds/${encodeURIComponent(name)}/activate`);
-    await Promise.all([loadWorlds(), loadServerStatus()]);
-    if (!document.getElementById('whitelistBody').classList.contains('hidden')) loadWhitelist();
-  } catch (err) {
-    alert('Error: ' + err.message);
-  }
+  return withLock('activate', async () => {
+    try {
+      await apiJson('POST', `/api/worlds/${encodeURIComponent(name)}/activate`);
+      await Promise.all([loadWorlds(), loadServerStatus()]);
+      if (!document.getElementById('whitelistBody').classList.contains('hidden')) loadWhitelist();
+    } catch (err) {
+      alert('Error: ' + err.message);
+    }
+  });
 }
 
 function downloadWorld(name) {
@@ -204,43 +277,56 @@ function downloadWorld(name) {
 
 // ── Properties Modal ──────────────────────────────────────────────────────────
 async function openProperties(name) {
+  const gen = ++_propsOpenGen;
   _propsWorld = name;
   document.getElementById('propsModalTitle').textContent = `${name} — server.properties`;
   document.getElementById('propsEditor').value = 'Loading…';
   openModal('propsModal');
   try {
     const data = await apiJson('GET', `/api/worlds/${encodeURIComponent(name)}/properties`);
+    if (gen !== _propsOpenGen) return;
     document.getElementById('propsEditor').value = data.content;
   } catch (err) {
+    if (gen !== _propsOpenGen) return;
     document.getElementById('propsEditor').value = 'Error: ' + err.message;
   }
 }
 
 document.getElementById('savePropsBtn').addEventListener('click', async () => {
-  if (!_propsWorld) return;
+  if (!_propsWorld || _locks.has('saveProps')) return;
+  _locks.add('saveProps');
+  const btn = document.getElementById('savePropsBtn');
   const content = document.getElementById('propsEditor').value;
+  btn.disabled = true;
+  setModalLocked('propsModal', true);
   try {
     await apiJson('POST', `/api/worlds/${encodeURIComponent(_propsWorld)}/properties`, { content });
     closeModal('propsModal');
   } catch (err) {
     alert('Save failed: ' + err.message);
+  } finally {
+    _locks.delete('saveProps');
+    btn.disabled = false;
+    setModalLocked('propsModal', false);
   }
 });
 
 // ── Images Modal ──────────────────────────────────────────────────────────────
 async function openImages(name) {
+  const gen = ++_imagesOpenGen;
   _imagesWorld = name;
   document.getElementById('imagesModalTitle').textContent = `${name} — Painting Images`;
   document.getElementById('imageUploadStatus').textContent = '';
   const warn = document.getElementById('imagesHostWarning');
   warn.classList.toggle('hidden', !!_serverHost);
   openModal('imagesModal');
-  await refreshImages();
-  // Rebuild data pack for this world in the background so images take effect
-  rebuildPaintingsForWorld(name);
+  await refreshImages(gen);
+  if (gen === _imagesOpenGen) rebuildPaintingsForWorld(name);
 }
 
 async function rebuildPaintingsForWorld(name) {
+  if (_rebuildInFlight) return;
+  _rebuildInFlight = true;
   const btn = document.getElementById('applyPaintingsBtn');
   const status = document.getElementById('imageUploadStatus');
   if (btn) { btn.disabled = true; btn.textContent = 'Applying…'; }
@@ -270,6 +356,7 @@ async function rebuildPaintingsForWorld(name) {
     }
   }
   if (btn) { btn.disabled = false; btn.textContent = 'Apply to World'; }
+  _rebuildInFlight = false;
 }
 
 document.getElementById('imagesHostLink').addEventListener('click', (e) => {
@@ -278,11 +365,12 @@ document.getElementById('imagesHostLink').addEventListener('click', (e) => {
   document.getElementById('serverHost').focus();
 });
 
-async function refreshImages() {
+async function refreshImages(expectedGen) {
   if (!_imagesWorld) return;
   const list = document.getElementById('imagesList');
   try {
     const images = await apiJson('GET', `/api/worlds/${encodeURIComponent(_imagesWorld)}/images`);
+    if (expectedGen != null && expectedGen !== _imagesOpenGen) return;
     if (images.length === 0) {
       list.innerHTML = '<p class="loading">No images uploaded yet.</p>';
     } else {
@@ -304,75 +392,127 @@ async function refreshImages() {
 
 document.getElementById('imagesList').addEventListener('click', async (e) => {
   const btn = e.target.closest('[data-del-image]');
-  if (!btn || !_imagesWorld) return;
+  if (!btn || !_imagesWorld || btn.disabled || _locks.has('imageDelete')) return;
+  _locks.add('imageDelete');
+  btn.disabled = true;
   const imgName = btn.dataset.delImage;
   try {
     await apiJson('DELETE', `/api/worlds/${encodeURIComponent(_imagesWorld)}/images/${encodeURIComponent(imgName)}`);
     await refreshImages();
   } catch (err) {
     alert('Delete failed: ' + err.message);
+    btn.disabled = false;
+  } finally {
+    _locks.delete('imageDelete');
   }
 });
 
 document.getElementById('applyPaintingsBtn').addEventListener('click', () => {
-  if (_imagesWorld) rebuildPaintingsForWorld(_imagesWorld);
+  if (_imagesWorld && !_rebuildInFlight && !_locks.has('rebuild')) {
+    withLock('rebuild', () => rebuildPaintingsForWorld(_imagesWorld));
+  }
 });
 
 document.getElementById('imageFileInput').addEventListener('change', async (e) => {
-  if (!_imagesWorld) return;
+  if (!_imagesWorld || _locks.has('imageUpload')) return;
   const status = document.getElementById('imageUploadStatus');
   const files = Array.from(e.target.files);
   if (!files.length) return;
+  _locks.add('imageUpload');
+  const input = e.target;
 
-  status.textContent = `Uploading ${files.length} file(s)…`;
-  status.className = 'status-text';
+  try {
+    status.textContent = `Uploading ${files.length} file(s)…`;
+    status.className = 'status-text';
 
-  let ok = 0, fail = 0;
-  for (const file of files) {
-    const fd = new FormData();
-    fd.append('image', file);
-    try {
-      const res = await fetch(`/api/worlds/${encodeURIComponent(_imagesWorld)}/images`, {
-        method: 'POST', body: fd,
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error);
-      ok++;
-    } catch (err) {
-      fail++;
+    let ok = 0, fail = 0;
+    for (const file of files) {
+      const fd = new FormData();
+      fd.append('image', file);
+      try {
+        const res = await fetch(`/api/worlds/${encodeURIComponent(_imagesWorld)}/images`, {
+          method: 'POST', body: fd,
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error);
+        ok++;
+      } catch {
+        fail++;
+      }
     }
-  }
 
-  status.textContent = `${ok} uploaded${fail ? `, ${fail} failed` : ''}`;
-  status.className = 'status-text ' + (fail ? 'err' : 'ok');
-  e.target.value = '';
-  await refreshImages();
+    status.textContent = `${ok} uploaded${fail ? `, ${fail} failed` : ''}`;
+    status.className = 'status-text ' + (fail ? 'err' : 'ok');
+    input.value = '';
+    await refreshImages();
+  } finally {
+    _locks.delete('imageUpload');
+  }
 });
 
 // ── Delete Modal ──────────────────────────────────────────────────────────────
 function openDeleteConfirm(name) {
+  if (_locks.has('delete')) {
+    alert('A delete is already in progress.');
+    return;
+  }
   _deleteWorld = name;
   document.getElementById('deleteModalText').textContent =
     `Are you sure you want to permanently delete "${name}"? This cannot be undone.`;
   openModal('deleteModal');
 }
 
+let _stopDeletePoll = null;
+
 document.getElementById('confirmDeleteBtn').addEventListener('click', async () => {
-  if (!_deleteWorld) return;
+  if (!_deleteWorld || _locks.has('delete')) return;
+  _locks.add('delete');
+  const btn = document.getElementById('confirmDeleteBtn');
+  const status = document.getElementById('deleteModalText');
+  const origText = status.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Deleting…';
+  setModalLocked('deleteModal', true);
+  if (_stopDeletePoll) _stopDeletePoll();
+
   try {
-    await apiJson('DELETE', `/api/worlds/${encodeURIComponent(_deleteWorld)}`);
-    closeModal('deleteModal');
-    await loadWorlds();
+    const { job_id } = await apiJson('DELETE', `/api/worlds/${encodeURIComponent(_deleteWorld)}`);
+    status.textContent = 'Deleting world files… large saves can take several minutes.';
+
+    _stopDeletePoll = startJobPoll(`/api/worlds/delete/${job_id}`, {
+      intervalMs: 2000,
+      onLog(lines) { status.textContent = lines[lines.length - 1] || status.textContent; },
+      onDone(job) {
+        _stopDeletePoll = null;
+        _locks.delete('delete');
+        setModalLocked('deleteModal', false);
+        btn.disabled = false;
+        btn.textContent = 'Delete';
+        status.textContent = origText;
+        if (job.status === 'done') {
+          closeModal('deleteModal');
+          loadWorlds();
+        } else {
+          alert('Delete failed: ' + (job.error || 'Unknown error'));
+        }
+      },
+    });
   } catch (err) {
+    _locks.delete('delete');
+    setModalLocked('deleteModal', false);
+    btn.disabled = false;
+    btn.textContent = 'Delete';
     alert('Delete failed: ' + err.message);
   }
 });
 
 // ── New World / Generate ──────────────────────────────────────────────────────
 document.getElementById('uploadWorldInput').addEventListener('change', async (e) => {
+  if (_locks.has('worldUpload')) return;
   const file = e.target.files[0];
   if (!file) return;
   e.target.value = '';
+  _locks.add('worldUpload');
   const fd = new FormData();
   fd.append('world', file);
   const label = document.querySelector('label[for="uploadWorldInput"]');
@@ -387,10 +527,15 @@ document.getElementById('uploadWorldInput').addEventListener('change', async (e)
     alert('Upload failed: ' + err.message);
   } finally {
     label.textContent = orig;
+    _locks.delete('worldUpload');
   }
 });
 
+let _stopGeneratePoll = null;
+
 document.getElementById('newWorldBtn').addEventListener('click', () => {
+  if (_locks.has('generate')) return;
+  if (_stopGeneratePoll) _stopGeneratePoll();
   document.getElementById('newWorldName').value = '';
   document.getElementById('inheritProps').checked = true;
   document.getElementById('generateLog').classList.add('hidden');
@@ -398,16 +543,19 @@ document.getElementById('newWorldBtn').addEventListener('click', () => {
   const startBtn = document.getElementById('startGenerateBtn');
   startBtn.disabled = false;
   startBtn.textContent = 'Generate';
-  startBtn.onclick = null;
+  setModalLocked('generateModal', false);
   document.getElementById('cancelGenerateBtn').dataset.close = 'generateModal';
   openModal('generateModal');
 });
 
 document.getElementById('startGenerateBtn').addEventListener('click', async () => {
+  if (_locks.has('generate')) return;
+  _locks.add('generate');
   const name = document.getElementById('newWorldName').value.trim();
   const inherit = document.getElementById('inheritProps').checked;
 
   if (!name) {
+    _locks.delete('generate');
     alert('Please enter a world name.');
     return;
   }
@@ -415,9 +563,12 @@ document.getElementById('startGenerateBtn').addEventListener('click', async () =
   const logEl = document.getElementById('generateLog');
   logEl.textContent = '';
   logEl.classList.remove('hidden');
-  document.getElementById('startGenerateBtn').disabled = true;
-  // Prevent closing mid-generation
+  const startBtn = document.getElementById('startGenerateBtn');
+  startBtn.disabled = true;
+  startBtn.textContent = 'Generating…';
+  setModalLocked('generateModal', true);
   document.getElementById('cancelGenerateBtn').removeAttribute('data-close');
+  if (_stopGeneratePoll) _stopGeneratePoll();
 
   function appendLog(lines) {
     logEl.textContent += lines.join('\n') + '\n';
@@ -429,70 +580,137 @@ document.getElementById('startGenerateBtn').addEventListener('click', async () =
       new_name: name,
       inherit_properties: inherit,
     });
-    _generateJobId = job_id;
-
-    let lastLogLen = 0;
-    _generatePoll = setInterval(async () => {
-      try {
-        const job = await apiJson('GET', `/api/worlds/generate/${job_id}`);
-        const newLines = job.log.slice(lastLogLen);
-        if (newLines.length) appendLog(newLines);
-        lastLogLen = job.log.length;
-
+    _stopGeneratePoll = startJobPoll(`/api/worlds/generate/${job_id}`, {
+      intervalMs: 1000,
+      onLog: appendLog,
+      onDone(job) {
+        _stopGeneratePoll = null;
+        _locks.delete('generate');
         if (job.status === 'done') {
-          clearInterval(_generatePoll);
           appendLog(['', '✔ Done! World generated successfully.']);
-          await loadWorlds();
+          loadWorlds();
           setTimeout(() => {
+            setModalLocked('generateModal', false);
             closeModal('generateModal');
-            document.getElementById('startGenerateBtn').disabled = false;
+            startBtn.disabled = false;
+            startBtn.textContent = 'Generate';
             document.getElementById('cancelGenerateBtn').dataset.close = 'generateModal';
           }, 1200);
-        } else if (job.status === 'error') {
-          clearInterval(_generatePoll);
-          appendLog(['', '✘ Error: ' + job.error]);
-          document.getElementById('startGenerateBtn').disabled = false;
+        } else {
+          appendLog(['', '✘ Error: ' + (job.error || 'Unknown error')]);
+          setModalLocked('generateModal', false);
+          startBtn.disabled = false;
+          startBtn.textContent = 'Generate';
           document.getElementById('cancelGenerateBtn').dataset.close = 'generateModal';
         }
-      } catch {
-        clearInterval(_generatePoll);
-        appendLog(['Poll error — check server.']);
-      }
-    }, 1000);
+      },
+    });
 
   } catch (err) {
+    _locks.delete('generate');
     appendLog(['Error starting generation: ' + err.message]);
-    document.getElementById('startGenerateBtn').disabled = false;
+    setModalLocked('generateModal', false);
+    startBtn.disabled = false;
+    startBtn.textContent = 'Generate';
     document.getElementById('cancelGenerateBtn').dataset.close = 'generateModal';
   }
 });
 
 // ── Pre-generate ──────────────────────────────────────────────────────────────
 let _pregenWorld = null;
-let _pregenPoll = null;
+let _pregenJobId = null;
+let _pregenPollWorld = null;
+let _pregenRunning = false;
+
+function _setPregenModalLocked(locked) {
+  const modal = document.getElementById('pregenModal');
+  const cancelBtn = document.getElementById('cancelPregenBtn');
+  const closeBtn = modal.querySelector('.modal-close');
+  _pregenRunning = locked;
+  if (locked) {
+    modal.dataset.locked = '1';
+    cancelBtn.textContent = 'Cancel Pre-gen';
+    cancelBtn.removeAttribute('data-close');
+    closeBtn.style.display = 'none';
+  } else {
+    delete modal.dataset.locked;
+    cancelBtn.textContent = 'Close';
+    cancelBtn.dataset.close = 'pregenModal';
+    closeBtn.style.display = '';
+    _pregenJobId = null;
+    _pregenPollWorld = null;
+  }
+}
+
+function _resetPregenModal() {
+  _setPregenModalLocked(false);
+  _locks.delete('pregen');
+  const cancelBtn = document.getElementById('cancelPregenBtn');
+  cancelBtn.disabled = false;
+  document.getElementById('startPregenBtn').disabled = false;
+  document.getElementById('startPregenBtn').textContent = 'Start Pre-gen';
+}
 
 function openPregen(name) {
+  if (_pregenRunning && _pregenPollWorld && _pregenPollWorld !== name) {
+    alert(`Pre-generation is already running for ${_pregenPollWorld}. Cancel it first.`);
+    return;
+  }
   _pregenWorld = name;
   document.getElementById('pregenModalTitle').textContent = `Pre-generate — ${name}`;
   document.getElementById('pregenCenterX').value = '0';
   document.getElementById('pregenCenterZ').value = '0';
   document.getElementById('pregenRadius').value = '1000';
   const logEl = document.getElementById('pregenLog');
-  logEl.textContent = '';
-  logEl.classList.add('hidden');
-  document.getElementById('startPregenBtn').disabled = false;
-  document.getElementById('startPregenBtn').textContent = 'Start Pre-gen';
-  document.getElementById('cancelPregenBtn').dataset.close = 'pregenModal';
+  if (!_pregenRunning) {
+    logEl.textContent = '';
+    logEl.classList.add('hidden');
+    _resetPregenModal();
+  }
   openModal('pregenModal');
 }
 
+let _stopPregenPoll = null;
+
+function _pollPregenJob(jobId) {
+  const logEl = document.getElementById('pregenLog');
+
+  function appendLog(lines) {
+    logEl.textContent += lines.join('\n') + '\n';
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  if (_stopPregenPoll) _stopPregenPoll();
+  _pregenPollWorld = _pregenWorld;
+  _stopPregenPoll = startJobPoll(
+    `/api/worlds/${encodeURIComponent(_pregenPollWorld)}/pregen/${jobId}`,
+    {
+      intervalMs: 1500,
+      onLog: appendLog,
+      onDone(job) {
+        _stopPregenPoll = null;
+        if (job.status === 'done') {
+          appendLog(['', '✔ Pre-generation complete.']);
+        } else if (job.status === 'cancelled') {
+          appendLog(['', 'Pre-generation cancelled. Server stopped.']);
+        } else {
+          appendLog(['', '✘ Error: ' + (job.error || 'Unknown error')]);
+        }
+        _resetPregenModal();
+      },
+    },
+  );
+}
+
 document.getElementById('startPregenBtn').addEventListener('click', async () => {
-  if (!_pregenWorld) return;
+  if (!_pregenWorld || _pregenRunning || _locks.has('pregen')) return;
+  _locks.add('pregen');
   const logEl = document.getElementById('pregenLog');
   logEl.textContent = '';
   logEl.classList.remove('hidden');
   document.getElementById('startPregenBtn').disabled = true;
-  document.getElementById('cancelPregenBtn').removeAttribute('data-close');
+  document.getElementById('startPregenBtn').textContent = 'Running…';
+  _setPregenModalLocked(true);
 
   const center_x = parseInt(document.getElementById('pregenCenterX').value, 10) || 0;
   const center_z = parseInt(document.getElementById('pregenCenterZ').value, 10) || 0;
@@ -507,41 +725,34 @@ document.getElementById('startPregenBtn').addEventListener('click', async () => 
     const { job_id } = await apiJson('POST', `/api/worlds/${encodeURIComponent(_pregenWorld)}/pregen`, {
       center_x, center_z, radius,
     });
-
-    let lastLogLen = 0;
-    if (_pregenPoll) clearInterval(_pregenPoll);
-    _pregenPoll = setInterval(async () => {
-      try {
-        const job = await apiJson('GET', `/api/worlds/${encodeURIComponent(_pregenWorld)}/pregen/${job_id}`);
-        const newLines = job.log.slice(lastLogLen);
-        if (newLines.length) appendLog(newLines);
-        lastLogLen = job.log.length;
-
-        if (job.status === 'done') {
-          clearInterval(_pregenPoll);
-          appendLog(['', '✔ Pre-generation complete.']);
-          document.getElementById('startPregenBtn').disabled = false;
-          document.getElementById('startPregenBtn').textContent = 'Start Pre-gen';
-          document.getElementById('cancelPregenBtn').dataset.close = 'pregenModal';
-        } else if (job.status === 'error') {
-          clearInterval(_pregenPoll);
-          appendLog(['', '✘ Error: ' + job.error]);
-          document.getElementById('startPregenBtn').disabled = false;
-          document.getElementById('startPregenBtn').textContent = 'Start Pre-gen';
-          document.getElementById('cancelPregenBtn').dataset.close = 'pregenModal';
-        }
-      } catch {
-        clearInterval(_pregenPoll);
-        appendLog(['Poll error — check server.']);
-        document.getElementById('startPregenBtn').disabled = false;
-        document.getElementById('cancelPregenBtn').dataset.close = 'pregenModal';
-      }
-    }, 1500);
+    _pregenJobId = job_id;
+    _pregenPollWorld = _pregenWorld;
+    _pollPregenJob(job_id);
   } catch (err) {
     appendLog(['Error: ' + err.message]);
-    document.getElementById('startPregenBtn').disabled = false;
-    document.getElementById('cancelPregenBtn').dataset.close = 'pregenModal';
+    _locks.delete('pregen');
+    _resetPregenModal();
   }
+});
+
+document.getElementById('cancelPregenBtn').addEventListener('click', async (e) => {
+  if (_pregenRunning && _pregenJobId) {
+    e.stopPropagation();
+    e.preventDefault();
+    const btn = document.getElementById('cancelPregenBtn');
+    if (btn.disabled) return;
+    btn.disabled = true;
+    btn.textContent = 'Cancelling…';
+    try {
+      await apiJson('POST', `/api/worlds/${encodeURIComponent(_pregenPollWorld || _pregenWorld)}/pregen/${_pregenJobId}/cancel`);
+    } catch (err) {
+      alert('Cancel failed: ' + err.message);
+      btn.disabled = false;
+      btn.textContent = 'Cancel Pre-gen';
+    }
+    return;
+  }
+  closeModal('pregenModal');
 });
 
 // ── Jars ──────────────────────────────────────────────────────────────────────
@@ -567,6 +778,7 @@ async function loadJars() {
 }
 
 document.getElementById('updateJarBtn').addEventListener('click', async () => {
+  if (_locks.has('jarUpdate')) return;
   const url = document.getElementById('jarUrl').value.trim();
   const statusEl = document.getElementById('jarUpdateStatus');
 
@@ -578,6 +790,7 @@ document.getElementById('updateJarBtn').addEventListener('click', async () => {
   }
 
   const btn = document.getElementById('updateJarBtn');
+  _locks.add('jarUpdate');
   btn.disabled = true;
   btn.textContent = 'Downloading…';
   statusEl.textContent = 'Downloading jar… this may take a moment.';
@@ -594,6 +807,7 @@ document.getElementById('updateJarBtn').addEventListener('click', async () => {
     statusEl.textContent = '✘ ' + err.message;
     statusEl.className = 'status-text err';
   } finally {
+    _locks.delete('jarUpdate');
     btn.disabled = false;
     btn.textContent = 'Download & Replace';
   }
@@ -677,11 +891,14 @@ function updateGiveBtn() {
   document.getElementById('givePaintingBtn').disabled = !(_selectedPlayer && _selectedPainting);
 }
 
-document.getElementById('refreshPlayersBtn').addEventListener('click', fetchPlayers);
+document.getElementById('refreshPlayersBtn').addEventListener('click', () => withLock('fetchPlayers', fetchPlayers));
 
 document.getElementById('givePaintingBtn').addEventListener('click', async () => {
-  if (!_selectedPlayer || !_selectedPainting || !_giveWorld) return;
+  if (!_selectedPlayer || !_selectedPainting || !_giveWorld || _locks.has('give')) return;
+  const btn = document.getElementById('givePaintingBtn');
   const statusEl = document.getElementById('giveStatus');
+  btn.disabled = true;
+  _locks.add('give');
   try {
     const data = await apiJson('POST', `/api/worlds/${encodeURIComponent(_giveWorld)}/rcon/give`, {
       player: _selectedPlayer,
@@ -692,6 +909,9 @@ document.getElementById('givePaintingBtn').addEventListener('click', async () =>
   } catch (err) {
     statusEl.textContent = '✘ ' + err.message;
     statusEl.className = 'give-status err';
+  } finally {
+    _locks.delete('give');
+    btn.disabled = !(_selectedPlayer && _selectedPainting);
   }
   statusEl.classList.remove('hidden');
 });
@@ -734,9 +954,11 @@ async function loadSettings() {
 }
 
 document.getElementById('serverIconInput').addEventListener('change', async (e) => {
+  if (_locks.has('serverIcon')) return;
   const file = e.target.files[0];
   e.target.value = '';
   if (!file) return;
+  _locks.add('serverIcon');
   const statusEl = document.getElementById('serverIconStatus');
   const form = new FormData();
   form.append('icon', file);
@@ -753,11 +975,17 @@ document.getElementById('serverIconInput').addEventListener('change', async (e) 
     statusEl.textContent = '✘ ' + err.message;
     statusEl.className = 'status-text err';
     statusEl.classList.remove('hidden');
+  } finally {
+    _locks.delete('serverIcon');
   }
 });
 
 document.getElementById('removeServerIconBtn').addEventListener('click', async () => {
+  if (_locks.has('serverIcon')) return;
+  _locks.add('serverIcon');
   const statusEl = document.getElementById('serverIconStatus');
+  const btn = document.getElementById('removeServerIconBtn');
+  btn.disabled = true;
   try {
     await apiJson('DELETE', '/api/server-icon');
     refreshServerIconPreview(false);
@@ -769,20 +997,35 @@ document.getElementById('removeServerIconBtn').addEventListener('click', async (
     statusEl.textContent = '✘ ' + err.message;
     statusEl.className = 'status-text err';
     statusEl.classList.remove('hidden');
+  } finally {
+    _locks.delete('serverIcon');
+    btn.disabled = false;
   }
 });
 
 document.getElementById('autoDetectBtn').addEventListener('click', async () => {
+  if (_locks.has('detectHost')) return;
+  _locks.add('detectHost');
+  const btn = document.getElementById('autoDetectBtn');
+  btn.disabled = true;
   try {
     const det = await apiJson('GET', '/api/detect-host');
     if (det.host) document.getElementById('serverHost').value = det.host;
   } catch { /* silent */ }
+  finally {
+    _locks.delete('detectHost');
+    btn.disabled = false;
+  }
 });
 
 document.getElementById('saveSettingsBtn').addEventListener('click', async () => {
+  if (_locks.has('saveSettings')) return;
   const host = document.getElementById('serverHost').value.trim();
   const jvmArgs = document.getElementById('jvmArgs').value.trim();
   const statusEl = document.getElementById('settingsStatus');
+  const btn = document.getElementById('saveSettingsBtn');
+  btn.disabled = true;
+  _locks.add('saveSettings');
   try {
     const motd = document.getElementById('motdInput').value;
     const data = await apiJson('POST', '/api/config', { server_host: host, public_port: 25565, jvm_args: jvmArgs });
@@ -799,11 +1042,17 @@ document.getElementById('saveSettingsBtn').addEventListener('click', async () =>
     statusEl.textContent = '✘ ' + err.message;
     statusEl.className = 'status-text err';
     statusEl.classList.remove('hidden');
+  } finally {
+    _locks.delete('saveSettings');
+    btn.disabled = false;
   }
 });
 
 // ── Logout ────────────────────────────────────────────────────────────────────
 document.getElementById('logoutBtn').addEventListener('click', async () => {
+  if (_locks.has('logout')) return;
+  _locks.add('logout');
+  document.getElementById('logoutBtn').disabled = true;
   await api('POST', '/logout');
   location.reload();
 });
@@ -824,11 +1073,14 @@ function scheduleStatusPoll(interval) {
 }
 
 async function loadServerStatus() {
+  if (_statusFetchInFlight) return;
+  _statusFetchInFlight = true;
   try {
     const data = await apiJson('GET', '/api/server/status');
     _lastServerStatus = data;
     updateServerHud(data);
   } catch { /* silent */ }
+  finally { _statusFetchInFlight = false; }
 }
 
 function updateServerHud(data) {
@@ -919,6 +1171,8 @@ document.getElementById('copyAddressBtn').addEventListener('click', async () => 
 });
 
 document.getElementById('startServerBtn').addEventListener('click', async () => {
+  if (_serverPending || _locks.has('serverAction')) return;
+  _locks.add('serverAction');
   _serverPending = 'starting';
   updateServerHud(_lastServerStatus);
   try {
@@ -927,12 +1181,16 @@ document.getElementById('startServerBtn').addEventListener('click', async () => 
     _serverPending = null;
     updateServerHud(_lastServerStatus);
     alert('Error: ' + err.message);
+    _locks.delete('serverAction');
     return;
   }
+  _locks.delete('serverAction');
   await loadServerStatus();
 });
 
 document.getElementById('stopServerBtn').addEventListener('click', async () => {
+  if (_serverPending || _locks.has('serverAction')) return;
+  _locks.add('serverAction');
   _serverPending = 'stopping';
   updateServerHud(_lastServerStatus);
   try {
@@ -941,8 +1199,10 @@ document.getElementById('stopServerBtn').addEventListener('click', async () => {
     _serverPending = null;
     updateServerHud(_lastServerStatus);
     alert('Error: ' + err.message);
+    _locks.delete('serverAction');
     return;
   }
+  _locks.delete('serverAction');
   await loadServerStatus();
 });
 
@@ -1017,22 +1277,30 @@ async function fetchCurrentOps() {
 }
 
 async function opPlayer(player) {
+  if (_locks.has('opAction')) return;
+  _locks.add('opAction');
   try {
     const data = await apiJson('POST', `/api/worlds/${encodeURIComponent(_opsWorld)}/rcon/op`, { player });
     showOpsStatus('✔ ' + (data.response || `${player} opped`), 'ok');
     await Promise.all([fetchOpsPlayers(), fetchCurrentOps()]);
   } catch (err) {
     showOpsStatus('✘ ' + err.message, 'err');
+  } finally {
+    _locks.delete('opAction');
   }
 }
 
 async function deopPlayer(player) {
+  if (_locks.has('opAction')) return;
+  _locks.add('opAction');
   try {
     const data = await apiJson('POST', `/api/worlds/${encodeURIComponent(_opsWorld)}/rcon/deop`, { player });
     showOpsStatus('✔ ' + (data.response || `${player} deopped`), 'ok');
     await Promise.all([fetchOpsPlayers(), fetchCurrentOps()]);
   } catch (err) {
     showOpsStatus('✘ ' + err.message, 'err');
+  } finally {
+    _locks.delete('opAction');
   }
 }
 
@@ -1043,13 +1311,13 @@ function showOpsStatus(msg, type) {
   el.classList.remove('hidden');
 }
 
-document.getElementById('refreshOpsPlayersBtn').addEventListener('click', fetchOpsPlayers);
-document.getElementById('refreshOpsListBtn').addEventListener('click', fetchCurrentOps);
+document.getElementById('refreshOpsPlayersBtn').addEventListener('click', () => withLock('opsRefresh', fetchOpsPlayers));
+document.getElementById('refreshOpsListBtn').addEventListener('click', () => withLock('opsRefresh', fetchCurrentOps));
 
 document.getElementById('opByNameBtn').addEventListener('click', async () => {
   const input = document.getElementById('opByNameInput');
   const player = input.value.trim();
-  if (!player) return;
+  if (!player || _locks.has('opAction')) return;
   input.value = '';
   await opPlayer(player);
 });
@@ -1070,23 +1338,33 @@ document.getElementById('rconCmdInput').addEventListener('keydown', e => {
 });
 
 async function sendRconCommand() {
-  if (!_activeWorld) return;
+  if (!_activeWorld || _locks.has('rcon')) return;
   const input = document.getElementById('rconCmdInput');
   const output = document.getElementById('rconOutput');
+  const sendBtn = document.getElementById('rconSendBtn');
   const cmd = input.value.trim();
   if (!cmd) return;
+  _locks.add('rcon');
+  sendBtn.disabled = true;
+  input.disabled = true;
   output.textContent = 'Sending…';
   output.classList.remove('hidden');
   try {
     const data = await apiJson('POST', `/api/worlds/${encodeURIComponent(_activeWorld)}/rcon/exec`, { command: cmd });
     output.textContent = data.response || '(empty response)';
+    input.value = '';
   } catch (err) {
     output.textContent = 'Error: ' + err.message;
+  } finally {
+    _locks.delete('rcon');
+    sendBtn.disabled = false;
+    input.disabled = false;
   }
 }
 
 // ── Whitelist ─────────────────────────────────────────────────────────────────
 async function loadWhitelist() {
+  return withLock('loadWhitelist', async () => {
   const list = document.getElementById('whitelistPlayers');
   const checkbox = document.getElementById('whitelistEnabled');
   try {
@@ -1106,6 +1384,7 @@ async function loadWhitelist() {
     checkbox.checked = false;
     list.innerHTML = '<li class="hud-list-empty">No active world.</li>';
   }
+  });
 }
 
 function showWhitelistStatus(msg, ok) {
@@ -1117,19 +1396,28 @@ function showWhitelistStatus(msg, ok) {
 }
 
 document.getElementById('whitelistEnabled').addEventListener('change', async (e) => {
+  if (_locks.has('whitelist')) { e.target.checked = !e.target.checked; return; }
+  _locks.add('whitelist');
+  e.target.disabled = true;
   try {
     await apiJson('POST', '/api/server/whitelist', { enabled: e.target.checked });
     showWhitelistStatus(e.target.checked ? 'Whitelist enabled' : 'Whitelist disabled', true);
   } catch (err) {
     e.target.checked = !e.target.checked;
     showWhitelistStatus(err.message, false);
+  } finally {
+    _locks.delete('whitelist');
+    e.target.disabled = false;
   }
 });
 
 document.getElementById('whitelistAddBtn').addEventListener('click', async () => {
   const input = document.getElementById('whitelistAddInput');
   const name = input.value.trim();
-  if (!name) return;
+  if (!name || _locks.has('whitelist')) return;
+  const btn = document.getElementById('whitelistAddBtn');
+  btn.disabled = true;
+  _locks.add('whitelist');
   try {
     await apiJson('POST', '/api/server/whitelist/add', { name });
     input.value = '';
@@ -1137,6 +1425,9 @@ document.getElementById('whitelistAddBtn').addEventListener('click', async () =>
     showWhitelistStatus(`Added ${name}`, true);
   } catch (err) {
     showWhitelistStatus(err.message, false);
+  } finally {
+    _locks.delete('whitelist');
+    btn.disabled = false;
   }
 });
 
@@ -1146,7 +1437,9 @@ document.getElementById('whitelistAddInput').addEventListener('keydown', e => {
 
 document.getElementById('whitelistPlayers').addEventListener('click', async (e) => {
   const btn = e.target.closest('[data-whitelist-remove]');
-  if (!btn) return;
+  if (!btn || btn.disabled || _locks.has('whitelist')) return;
+  btn.disabled = true;
+  _locks.add('whitelist');
   const name = btn.dataset.whitelistRemove;
   try {
     await apiJson('DELETE', `/api/server/whitelist/${encodeURIComponent(name)}`);
@@ -1154,11 +1447,16 @@ document.getElementById('whitelistPlayers').addEventListener('click', async (e) 
     showWhitelistStatus(`Removed ${name}`, true);
   } catch (err) {
     showWhitelistStatus(err.message, false);
+    btn.disabled = false;
+  } finally {
+    _locks.delete('whitelist');
   }
 });
 
 // ── Server Logs ───────────────────────────────────────────────────────────────
 async function loadServerLogs() {
+  if (_logsFetchInFlight) return;
+  _logsFetchInFlight = true;
   const output = document.getElementById('serverLogsOutput');
   const pathEl = document.getElementById('serverLogsPath');
   try {
@@ -1169,10 +1467,12 @@ async function loadServerLogs() {
   } catch (err) {
     output.textContent = err.message;
     pathEl.textContent = '';
+  } finally {
+    _logsFetchInFlight = false;
   }
 }
 
-document.getElementById('refreshLogsBtn').addEventListener('click', loadServerLogs);
+document.getElementById('refreshLogsBtn').addEventListener('click', () => withLock('logs', loadServerLogs));
 
 // ── Collapsible sections ───────────────────────────────────────────────────────
 document.querySelectorAll('.collapsible-header').forEach(header => {

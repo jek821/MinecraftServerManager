@@ -76,11 +76,22 @@ _DP_MCMETA = json.dumps({
 _jobs: dict = {}
 _jobs_lock = threading.Lock()
 
+_pregen_handles: dict[str, dict] = {}
+_pregen_handles_lock = threading.Lock()
+
 _server_proc: 'subprocess.Popen | None' = None
 _server_start_time: float | None = None
 _server_lock = threading.Lock()
+_config_lock = threading.Lock()
 _rcon_write_lock = threading.Lock()
 _props_write_lock = threading.Lock()
+_rcon_route_lock = threading.RLock()
+_whitelist_lock = threading.Lock()
+_world_locks: dict[str, threading.Lock] = {}
+_world_locks_guard = threading.Lock()
+_rebuild_busy: set[str] = set()
+_rebuild_busy_lock = threading.Lock()
+_icon_lock = threading.Lock()
 
 
 # ─── Config ──────────────────────────────────────────────────────────────────
@@ -122,7 +133,9 @@ def load_config() -> dict:
         defaults['mc_internal_port'] = DEFAULT_MC_INTERNAL_PORT
         dirty = True
     if dirty:
-        save_config({k: v for k, v in defaults.items() if k != 'port'})
+        CONFIG_FILE.write_text(json.dumps(
+            {k: v for k, v in defaults.items() if k != 'port'}, indent=2,
+        ))
     return defaults
 
 
@@ -199,7 +212,65 @@ def _test_resource_pack_url(url: str) -> dict:
 
 
 def save_config(config: dict) -> None:
-    CONFIG_FILE.write_text(json.dumps(config, indent=2))
+    with _config_lock:
+        CONFIG_FILE.write_text(json.dumps(config, indent=2))
+
+
+def _world_op_lock(world_name: str) -> threading.Lock:
+    with _world_locks_guard:
+        if world_name not in _world_locks:
+            _world_locks[world_name] = threading.Lock()
+        return _world_locks[world_name]
+
+
+def _background_mc_jobs_running() -> bool:
+    with _jobs_lock:
+        return any(
+            j.get('status') == 'running' and j.get('type') in ('pregen', 'generate')
+            for j in _jobs.values()
+        )
+
+
+def _managed_server_running() -> bool:
+    with _server_lock:
+        return _server_proc is not None and _server_proc.poll() is None
+
+
+def _mc_port_busy() -> bool:
+    return _managed_server_running() or _background_mc_jobs_running()
+
+
+def _try_reserve_job(world: str | None, job_type: str) -> str | None:
+    """Atomically register a background job, or return None if busy."""
+    with _server_lock:
+        managed_running = _server_proc is not None and _server_proc.poll() is None
+    with _jobs_lock:
+        if job_type in ('pregen', 'generate') and managed_running:
+            return None
+        if job_type in ('pregen', 'generate'):
+            if any(
+                j.get('status') == 'running' and j.get('type') in ('pregen', 'generate')
+                for j in _jobs.values()
+            ):
+                return None
+        if world is not None:
+            if any(
+                j.get('status') == 'running' and j.get('world') == world
+                for j in _jobs.values()
+            ):
+                return None
+        job_id = str(uuid.uuid4())
+        entry: dict = {
+            'status': 'running',
+            'log': [],
+            'error': None,
+            'type': job_type,
+            'cancel_requested': False,
+        }
+        if world is not None:
+            entry['world'] = world
+        _jobs[job_id] = entry
+        return job_id
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -400,6 +471,11 @@ class RCONError(Exception):
 
 
 def _rcon_exec(host: str, port: int, password: str, command: str) -> str:
+    with _rcon_route_lock:
+        return _rcon_exec_unlocked(host, port, password, command)
+
+
+def _rcon_exec_unlocked(host: str, port: int, password: str, command: str) -> str:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(10)
         try:
@@ -607,13 +683,15 @@ def _read_whitelist(world_dir: Path) -> list[dict]:
     if not wl.exists():
         return []
     try:
-        return json.loads(wl.read_text())
+        with _whitelist_lock:
+            return json.loads(wl.read_text())
     except Exception:
         return []
 
 
 def _write_whitelist(world_dir: Path, entries: list[dict]) -> None:
-    (world_dir / 'whitelist.json').write_text(json.dumps(entries, indent=2))
+    with _whitelist_lock:
+        (world_dir / 'whitelist.json').write_text(json.dumps(entries, indent=2))
 
 
 def _whitelist_enabled(world_dir: Path) -> bool:
@@ -693,6 +771,24 @@ def _ensure_rcon(world_dir: Path) -> None:
 
 def rebuild_paintings(world_dir: Path) -> dict:
     """Full pipeline: data pack → resource pack zip → server.properties for one world."""
+    world_name = world_dir.name
+    lock = _world_op_lock(world_name)
+    if not lock.acquire(blocking=False):
+        raise RuntimeError('Painting rebuild already in progress for this world')
+    with _rebuild_busy_lock:
+        if world_name in _rebuild_busy:
+            lock.release()
+            raise RuntimeError('Painting rebuild already in progress for this world')
+        _rebuild_busy.add(world_name)
+    try:
+        return _rebuild_paintings_locked(world_dir)
+    finally:
+        with _rebuild_busy_lock:
+            _rebuild_busy.discard(world_name)
+        lock.release()
+
+
+def _rebuild_paintings_locked(world_dir: Path) -> dict:
     paintings_dir = _paintings_dir(world_dir)
 
     _rebuild_datapack(world_dir, paintings_dir)
@@ -700,8 +796,10 @@ def rebuild_paintings(world_dir: Path) -> dict:
     pack_bytes = _build_resource_pack_zip(paintings_dir)
     sha1 = hashlib.sha1(pack_bytes).hexdigest()
 
-    # Cache on disk so /resourcepack/<name> can serve it cheaply
-    (world_dir / '.resource_pack.zip').write_bytes(pack_bytes)
+    cached = world_dir / '.resource_pack.zip'
+    tmp = world_dir / '.resource_pack.zip.tmp'
+    tmp.write_bytes(pack_bytes)
+    tmp.replace(cached)
 
     config = load_config()
     host = config.get('server_host', '').strip()
@@ -833,9 +931,14 @@ def activate_world(name):
     world_dir = safe_child(WORLDS_DIR, name)
     if not world_dir.is_dir():
         return jsonify({'error': 'World not found'}), 404
-    config = load_config()
-    config['active_world'] = name
-    save_config(config)
+    if _world_has_running_job(name):
+        return jsonify({'error': 'A background job is running for this world'}), 400
+    if _managed_server_running():
+        return jsonify({'error': 'Stop the server before changing the active world'}), 400
+    with _config_lock:
+        config = load_config()
+        config['active_world'] = name
+        CONFIG_FILE.write_text(json.dumps(config, indent=2))
     _apply_server_icon(world_dir)
     return jsonify({'ok': True})
 
@@ -846,6 +949,8 @@ def download_world(name):
     world_dir = safe_child(WORLDS_DIR, name)
     if not world_dir.is_dir():
         return jsonify({'error': 'World not found'}), 404
+    if _world_has_running_job(name):
+        return jsonify({'error': 'A background job is running for this world'}), 400
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
         for fp in world_dir.rglob('*'):
@@ -868,11 +973,14 @@ def get_properties(name):
 @app.route('/api/worlds/<name>/properties', methods=['POST'])
 @require_auth
 def save_properties(name):
+    if _world_dir_busy(name):
+        return jsonify({'error': 'A background job is running for this world'}), 400
     props = safe_child(WORLDS_DIR, name) / 'server.properties'
     if not props.exists():
         return jsonify({'error': 'server.properties not found'}), 404
     data = request.get_json() or {}
-    props.write_text(data.get('content', ''))
+    with _props_write_lock:
+        props.write_text(data.get('content', ''))
     return jsonify({'ok': True})
 
 
@@ -898,6 +1006,8 @@ def upload_image(name):
     world_dir = safe_child(WORLDS_DIR, name)
     if not world_dir.is_dir():
         return jsonify({'error': 'World not found'}), 404
+    if _world_dir_busy(name):
+        return jsonify({'error': 'A background job is running for this world'}), 400
     file = request.files.get('image')
     if not file or not file.filename:
         return jsonify({'error': 'No file provided'}), 400
@@ -920,6 +1030,8 @@ def delete_image(name, filename):
     world_dir = safe_child(WORLDS_DIR, name)
     if not world_dir.is_dir():
         return jsonify({'error': 'World not found'}), 404
+    if _world_dir_busy(name):
+        return jsonify({'error': 'A background job is running for this world'}), 400
     img = _paintings_dir(world_dir) / Path(filename).name
     if not img.is_file():
         return jsonify({'error': 'Image not found'}), 404
@@ -934,11 +1046,117 @@ def rebuild_paintings_endpoint(name):
     world_dir = safe_child(WORLDS_DIR, name)
     if not world_dir.is_dir():
         return jsonify({'error': 'World not found'}), 404
+    if _world_dir_busy(name):
+        return jsonify({'error': 'A background job is running for this world'}), 400
     try:
         pack_info = rebuild_paintings(world_dir)
         return jsonify({'ok': True, 'pack': pack_info})
+    except RuntimeError as e:
+        if 'already in progress' in str(e):
+            return jsonify({'error': str(e)}), 409
+        return jsonify({'error': str(e)}), 500
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+def _world_has_running_job(world_name: str, job_type: str | None = None) -> bool:
+    with _jobs_lock:
+        return any(
+            j.get('status') == 'running'
+            and j.get('world') == world_name
+            and (job_type is None or j.get('type') == job_type)
+            for j in _jobs.values()
+        )
+
+
+def _world_dir_busy(world_name: str) -> bool:
+    return _world_has_running_job(world_name) or _background_mc_jobs_running()
+
+
+_MAX_FINISHED_JOBS = 50
+
+
+def _prune_finished_jobs() -> None:
+    with _jobs_lock:
+        finished = [
+            (jid, j) for jid, j in _jobs.items()
+            if j.get('status') != 'running'
+        ]
+        if len(finished) <= _MAX_FINISHED_JOBS:
+            return
+        finished.sort(key=lambda item: item[1].get('finished_at', 0))
+        for jid, _ in finished[: len(finished) - _MAX_FINISHED_JOBS]:
+            _jobs.pop(jid, None)
+
+
+def _finish_job(job_id: str, status: str = 'done', error: str | None = None) -> None:
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job or job.get('status') != 'running':
+            return
+        job['status'] = status
+        if error:
+            job['error'] = error
+        job['finished_at'] = time.time()
+    _prune_finished_jobs()
+
+
+def _job_cancel_requested(job_id: str) -> bool:
+    with _jobs_lock:
+        return bool(_jobs.get(job_id, {}).get('cancel_requested'))
+
+
+def _request_job_cancel(job_id: str) -> None:
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if job and job.get('status') == 'running':
+            job['cancel_requested'] = True
+    with _pregen_handles_lock:
+        handle = _pregen_handles.get(job_id)
+    if handle:
+        handle['cancel'].set()
+
+
+def _run_delete(job_id: str, world_name: str):
+    world_dir = safe_child(WORLDS_DIR, world_name)
+
+    def log(msg: str):
+        with _jobs_lock:
+            _jobs[job_id]['log'].append(msg)
+
+    def set_status(status: str, error: str | None = None):
+        with _jobs_lock:
+            if _jobs.get(job_id, {}).get('status') != 'running':
+                return
+            _jobs[job_id]['status'] = status
+            if error:
+                _jobs[job_id]['error'] = error
+            _jobs[job_id]['finished_at'] = time.time()
+        _prune_finished_jobs()
+
+    try:
+        lock = _world_op_lock(world_name)
+        lock.acquire()
+        try:
+            if not world_dir.is_dir():
+                raise RuntimeError(f'World "{world_name}" not found')
+
+            config = load_config()
+            if config.get('active_world') == world_name:
+                with _config_lock:
+                    cfg = load_config()
+                    cfg['active_world'] = None
+                    CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+                log('Cleared active world.')
+
+            log('Deleting world files (large worlds may take several minutes)…')
+            shutil.rmtree(world_dir)
+        finally:
+            lock.release()
+        log('World deleted.')
+        set_status('done')
+    except Exception as e:
+        set_status('error', str(e))
 
 
 @app.route('/api/worlds/<name>', methods=['DELETE'])
@@ -947,12 +1165,27 @@ def delete_world(name):
     world_dir = safe_child(WORLDS_DIR, name)
     if not world_dir.is_dir():
         return jsonify({'error': 'World not found'}), 404
-    shutil.rmtree(world_dir)
-    config = load_config()
-    if config.get('active_world') == name:
-        config['active_world'] = None
-        save_config(config)
-    return jsonify({'ok': True})
+
+    if _managed_server_running():
+        return jsonify({'error': 'Stop the server before deleting a world'}), 400
+
+    job_id = _try_reserve_job(name, 'delete')
+    if not job_id:
+        return jsonify({'error': 'A background job is already running for this world'}), 400
+
+    t = threading.Thread(target=_run_delete, args=(job_id, name), daemon=True)
+    t.start()
+    return jsonify({'job_id': job_id})
+
+
+@app.route('/api/worlds/delete/<job_id>')
+@require_auth
+def delete_status(job_id):
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if not job:
+        return jsonify({'error': 'Job not found'}), 404
+    return jsonify(job)
 
 
 @app.route('/api/worlds/<name>/rename', methods=['POST'])
@@ -961,6 +1194,8 @@ def rename_world(name):
     world_dir = safe_child(WORLDS_DIR, name)
     if not world_dir.is_dir():
         return jsonify({'error': 'World not found'}), 404
+    if _managed_server_running():
+        return jsonify({'error': 'Stop the server before renaming a world'}), 400
     data = request.get_json() or {}
     new_name = data.get('new_name', '').strip()
     if not valid_world_name(new_name):
@@ -968,12 +1203,33 @@ def rename_world(name):
     new_dir = WORLDS_DIR / new_name
     if new_dir.exists():
         return jsonify({'error': 'A world with that name already exists'}), 409
-    world_dir.rename(new_dir)
-    config = load_config()
-    if config.get('active_world') == name:
-        config['active_world'] = new_name
-        save_config(config)
-    return jsonify({'ok': True, 'new_name': new_name})
+    if _world_has_running_job(new_name):
+        return jsonify({'error': 'A background job is already running for the target name'}), 400
+    job_id = _try_reserve_job(name, 'rename')
+    if not job_id:
+        return jsonify({'error': 'A background job is already running for this world'}), 400
+    lock = _world_op_lock(name)
+    try:
+        lock.acquire()
+        if not world_dir.is_dir():
+            _finish_job(job_id, 'error', 'World not found')
+            return jsonify({'error': 'World not found'}), 404
+        if new_dir.exists():
+            _finish_job(job_id, 'error', 'A world with that name already exists')
+            return jsonify({'error': 'A world with that name already exists'}), 409
+        world_dir.rename(new_dir)
+        with _config_lock:
+            config = load_config()
+            if config.get('active_world') == name:
+                config['active_world'] = new_name
+                CONFIG_FILE.write_text(json.dumps(config, indent=2))
+        _finish_job(job_id)
+        return jsonify({'ok': True, 'new_name': new_name})
+    except OSError as e:
+        _finish_job(job_id, 'error', str(e))
+        return jsonify({'error': str(e)}), 500
+    finally:
+        lock.release()
 
 
 @app.route('/api/worlds/upload', methods=['POST'])
@@ -990,7 +1246,15 @@ def upload_world():
     world_dir = WORLDS_DIR / world_name
     if world_dir.exists():
         return jsonify({'error': f'A world named "{world_name}" already exists'}), 409
+    job_id = _try_reserve_job(world_name, 'upload')
+    if not job_id:
+        return jsonify({'error': 'A background job is already running for this world'}), 400
+    lock = _world_op_lock(world_name)
     try:
+        lock.acquire()
+        if world_dir.exists():
+            _finish_job(job_id, 'error', f'A world named "{world_name}" already exists')
+            return jsonify({'error': f'A world named "{world_name}" already exists'}), 409
         data = file.read()
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
             # Detect whether the zip has a single top-level folder (common for world exports)
@@ -998,7 +1262,7 @@ def upload_world():
             top = {n.split('/')[0] for n in names if n.strip('/')}
             if len(top) == 1:
                 prefix = next(iter(top)) + '/'
-                world_dir.mkdir(parents=True)
+                world_dir.mkdir(parents=True, exist_ok=False)
                 for member in zf.infolist():
                     rel = member.filename[len(prefix):]
                     if not rel:
@@ -1010,18 +1274,22 @@ def upload_world():
                         dest.parent.mkdir(parents=True, exist_ok=True)
                         dest.write_bytes(zf.read(member.filename))
             else:
-                world_dir.mkdir(parents=True)
+                world_dir.mkdir(parents=True, exist_ok=False)
                 zf.extractall(world_dir)
         (world_dir / 'eula.txt').write_text('eula=true\n')
         try:
             rebuild_paintings(world_dir)
         except Exception as e:
             app.logger.error('rebuild_paintings after upload failed for %s: %s', world_name, e)
+        _finish_job(job_id)
         return jsonify({'ok': True, 'name': world_name})
     except Exception as e:
         if world_dir.exists():
             shutil.rmtree(world_dir, ignore_errors=True)
+        _finish_job(job_id, 'error', str(e))
         return jsonify({'error': str(e)}), 500
+    finally:
+        lock.release()
 
 
 # ─── World Generation ─────────────────────────────────────────────────────────
@@ -1038,16 +1306,22 @@ def _run_generate(job_id: str, new_name: str, inherit_properties: bool, old_acti
 
     def set_status(status: str, error: str | None = None):
         with _jobs_lock:
+            if _jobs.get(job_id, {}).get('status') != 'running':
+                return
             _jobs[job_id]['status'] = status
             if error:
                 _jobs[job_id]['error'] = error
+            _jobs[job_id]['finished_at'] = time.time()
+        _prune_finished_jobs()
 
     new_dir = WORLDS_DIR / new_name
+    created_dir = False
     try:
         if new_dir.exists():
             raise RuntimeError(f'A world named "{new_name}" already exists')
 
         new_dir.mkdir(parents=True)
+        created_dir = True
         log(f'Created directory: {new_dir.name}/')
 
         # Accept EULA automatically
@@ -1071,6 +1345,7 @@ def _run_generate(job_id: str, new_name: str, inherit_properties: bool, old_acti
             raise RuntimeError('server.jar not found in jars/ directory')
 
         log(f'Starting server: {java_cmd} {" ".join(jvm_args)} -jar {jar.name} --nogui')
+        ready_event = threading.Event()
         proc = subprocess.Popen(
             [java_cmd, *jvm_args, '-jar', str(jar), '--nogui'],
             cwd=str(new_dir),
@@ -1081,23 +1356,20 @@ def _run_generate(job_id: str, new_name: str, inherit_properties: bool, old_acti
         )
 
         assert proc.stdout and proc.stdin
-        world_done = False
-        for line in proc.stdout:
-            line = line.rstrip()
-            log(line)
-            if 'Done (' in line:
-                world_done = True
-                log('--- World generated. Sending stop command... ---')
-                try:
-                    proc.stdin.write('stop\n')
-                    proc.stdin.flush()
-                except OSError:
-                    proc.terminate()
-                break
+        threading.Thread(
+            target=_drain_process_output,
+            args=(proc, log, ready_event),
+            daemon=True,
+        ).start()
 
-        # Drain remaining output after stop
-        for line in proc.stdout:
-            log(line.rstrip())
+        world_done = ready_event.wait(timeout=180)
+        if world_done:
+            log('--- World generated. Sending stop command... ---')
+            try:
+                proc.stdin.write('stop\n')
+                proc.stdin.flush()
+            except OSError:
+                proc.terminate()
 
         try:
             proc.wait(timeout=30)
@@ -1107,12 +1379,13 @@ def _run_generate(job_id: str, new_name: str, inherit_properties: bool, old_acti
             raise RuntimeError('Server took too long to stop after world generation')
 
         if not world_done:
-            raise RuntimeError('Server exited before world generation completed')
+            raise RuntimeError('Server timed out or exited before world generation completed')
 
         # Mark new world as active
-        config = load_config()
-        config['active_world'] = new_name
-        save_config(config)
+        with _config_lock:
+            config = load_config()
+            config['active_world'] = new_name
+            CONFIG_FILE.write_text(json.dumps(config, indent=2))
         log(f'Set "{new_name}" as active world.')
 
         try:
@@ -1125,7 +1398,7 @@ def _run_generate(job_id: str, new_name: str, inherit_properties: bool, old_acti
 
     except Exception as e:
         set_status('error', str(e))
-        if new_dir.exists():
+        if created_dir and new_dir.exists():
             shutil.rmtree(new_dir, ignore_errors=True)
 
 
@@ -1139,12 +1412,20 @@ def start_generate():
     if not valid_world_name(new_name):
         return jsonify({'error': 'Invalid world name'}), 400
 
+    new_dir = WORLDS_DIR / new_name
+    if new_dir.exists():
+        return jsonify({'error': f'A world named "{new_name}" already exists'}), 409
+
+    job_id = _try_reserve_job(new_name, 'generate')
+    if not job_id:
+        if _managed_server_running():
+            return jsonify({'error': 'Stop the server before generating a world'}), 400
+        return jsonify({
+            'error': 'World generation or another background server task is already running',
+        }), 400
+
     config = load_config()
     old_active = config.get('active_world')
-
-    job_id = str(uuid.uuid4())
-    with _jobs_lock:
-        _jobs[job_id] = {'status': 'running', 'log': [], 'error': None}
 
     t = threading.Thread(
         target=_run_generate,
@@ -1186,12 +1467,89 @@ def _ensure_chunky_plugin(world_dir: Path) -> Path:
     return dest
 
 
+def _remove_stale_session_lock(world_dir: Path, level: str, log) -> None:
+    lock = world_dir / level / 'session.lock'
+    if lock.exists():
+        log(f'Removing stale session.lock from {level}/')
+        try:
+            lock.unlink()
+        except OSError as e:
+            log(f'Warning: could not remove session.lock: {e}')
+
+
+def _drain_process_output(proc: subprocess.Popen, log, ready_event: threading.Event | None = None) -> None:
+    try:
+        assert proc.stdout
+        for line in proc.stdout:
+            line = line.rstrip()
+            if line:
+                log(line)
+            if ready_event is not None and 'Done (' in line:
+                ready_event.set()
+    except Exception:
+        pass
+
+
+def _stop_background_mc(
+    proc: subprocess.Popen,
+    cfg: dict | None,
+    log,
+    *,
+    cancelled: bool = False,
+) -> None:
+    if cancelled:
+        log('Stopping pre-generation…')
+    if cfg and cfg.get('enabled') and cfg.get('password'):
+        try:
+            _rcon_exec('localhost', cfg['port'], cfg['password'], 'chunky cancel')
+        except RCONError:
+            pass
+        try:
+            _rcon_exec('localhost', cfg['port'], cfg['password'], 'stop')
+        except RCONError:
+            if proc.stdin and proc.poll() is None:
+                try:
+                    proc.stdin.write('stop\n')
+                    proc.stdin.flush()
+                except OSError:
+                    proc.terminate()
+    elif proc.poll() is None:
+        if proc.stdin:
+            try:
+                proc.stdin.write('stop\n')
+                proc.stdin.flush()
+            except OSError:
+                proc.terminate()
+        else:
+            proc.terminate()
+
+    try:
+        proc.wait(timeout=90)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
+def _pregen_sleep(seconds: int, job_id: str, cancel_event: threading.Event) -> bool:
+    """Sleep in 1s slices; return True if cancel was requested."""
+    for _ in range(seconds):
+        if cancel_event.is_set() or _job_cancel_requested(job_id):
+            return True
+        time.sleep(1)
+    return cancel_event.is_set() or _job_cancel_requested(job_id)
+
+
 def _run_pregen(job_id: str, world_name: str, center_x: int, center_z: int, radius: int):
     jar = JARS_DIR / 'server.jar'
     config = load_config()
     java_cmd = config.get('java_cmd', 'java')
     jvm_args = shlex.split(config.get('jvm_args', _AIKAR_FLAGS))
     world_dir = WORLDS_DIR / world_name
+    cancel_event = threading.Event()
+    ready_event = threading.Event()
+    proc: subprocess.Popen | None = None
+    cfg: dict | None = None
+    cancelled = False
 
     def log(msg: str):
         with _jobs_lock:
@@ -1199,11 +1557,14 @@ def _run_pregen(job_id: str, world_name: str, center_x: int, center_z: int, radi
 
     def set_status(status: str, error: str | None = None):
         with _jobs_lock:
+            if _jobs.get(job_id, {}).get('status') != 'running':
+                return
             _jobs[job_id]['status'] = status
             if error:
                 _jobs[job_id]['error'] = error
+            _jobs[job_id]['finished_at'] = time.time()
+        _prune_finished_jobs()
 
-    proc = None
     try:
         if not world_dir.is_dir():
             raise RuntimeError(f'World "{world_name}" not found')
@@ -1222,7 +1583,10 @@ def _run_pregen(job_id: str, world_name: str, center_x: int, center_z: int, radi
             raise RuntimeError('server.properties not found — start the server once first')
 
         level = get_level_name(world_dir)
+        _remove_stale_session_lock(world_dir, level, log)
+
         log(f'Pre-generating world "{level}" — center ({center_x}, {center_z}), radius {radius} blocks')
+        log('Works on existing saves — already-explored terrain is skipped.')
         log('Requires a Paper server jar (vanilla will not work).')
         log(f'Starting server: {java_cmd} -jar {jar.name} --nogui')
 
@@ -1234,88 +1598,95 @@ def _run_pregen(job_id: str, world_name: str, center_x: int, center_z: int, radi
             stderr=subprocess.STDOUT,
             text=True,
         )
+        with _pregen_handles_lock:
+            _pregen_handles[job_id] = {'proc': proc, 'cancel': cancel_event, 'cfg': None}
 
-        assert proc.stdout
-        ready = False
-        for line in proc.stdout:
-            line = line.rstrip()
-            log(line)
-            if 'Done (' in line:
-                ready = True
-                break
+        threading.Thread(
+            target=_drain_process_output,
+            args=(proc, log, ready_event),
+            daemon=True,
+        ).start()
 
-        if not ready:
-            raise RuntimeError('Server exited before finishing startup')
+        if not ready_event.wait(timeout=180):
+            raise RuntimeError('Server timed out during startup')
 
-        log('Waiting for plugins to load…')
-        time.sleep(4)
+        if cancel_event.is_set() or _job_cancel_requested(job_id):
+            cancelled = True
+            log('--- Cancelled before pre-generation started ---')
+        else:
+            log('Waiting for plugins to load…')
+            if _pregen_sleep(4, job_id, cancel_event):
+                cancelled = True
+                log('--- Cancelled ---')
+            else:
+                cfg = _rcon_settings(world_dir)
+                with _pregen_handles_lock:
+                    if job_id in _pregen_handles:
+                        _pregen_handles[job_id]['cfg'] = cfg
+                if not cfg['enabled'] or not cfg['password']:
+                    raise RuntimeError('RCON not configured')
 
-        cfg = _rcon_settings(world_dir)
-        if not cfg['enabled'] or not cfg['password']:
-            raise RuntimeError('RCON not configured')
+                def rcon(cmd: str) -> str:
+                    resp = _rcon_exec('localhost', cfg['port'], cfg['password'], cmd)
+                    clean = re.sub(r'§.', '', resp).strip()
+                    log(f'> {cmd}')
+                    if clean:
+                        log(clean)
+                    return clean.lower()
 
-        def rcon(cmd: str) -> str:
-            resp = _rcon_exec('localhost', cfg['port'], cfg['password'], cmd)
-            clean = re.sub(r'§.', '', resp).strip()
-            log(f'> {cmd}')
-            if clean:
-                log(clean)
-            return clean.lower()
-
-        for cmd in (
-            f'chunky world {level}',
-            f'chunky center {center_x} {center_z}',
-            f'chunky radius {radius}',
-            'chunky start',
-        ):
-            out = rcon(cmd)
-            if any(x in out for x in ('unknown command', 'not found', 'no such command', 'error')):
-                raise RuntimeError(
-                    'Chunky command failed — install a Paper server jar from Update Server Version'
-                )
-
-        log('--- Pre-generation running (this may take a while) ---')
-        while True:
-            time.sleep(8)
-            try:
-                out = rcon('chunky progress')
-            except RCONError as e:
-                log(f'RCON error: {e}')
-                break
-            if any(x in out for x in ('100%', '100.00%', 'no tasks', 'no task', 'finished', 'complete')):
-                log('--- Pre-generation complete ---')
-                break
-
-        try:
-            rcon('chunky cancel')
-        except RCONError:
-            pass
-        try:
-            _rcon_exec('localhost', cfg['port'], cfg['password'], 'stop')
-        except RCONError:
-            if proc.stdin:
                 try:
-                    proc.stdin.write('stop\n')
-                    proc.stdin.flush()
-                except OSError:
-                    proc.terminate()
+                    rcon('chunky cancel')
+                except RCONError:
+                    pass
 
-        for line in proc.stdout:
-            log(line.rstrip())
+                for cmd in (
+                    f'chunky world {level}',
+                    f'chunky center {center_x} {center_z}',
+                    f'chunky radius {radius}',
+                    'chunky start',
+                ):
+                    if cancel_event.is_set() or _job_cancel_requested(job_id):
+                        cancelled = True
+                        log('--- Cancelled ---')
+                        break
+                    out = rcon(cmd)
+                    if any(x in out for x in ('unknown command', 'not found', 'no such command', 'error')):
+                        raise RuntimeError(
+                            'Chunky command failed — install a Paper server jar from Update Server Version'
+                        )
 
-        try:
-            proc.wait(timeout=90)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-
-        set_status('done')
+                if not cancelled:
+                    log('--- Pre-generation running (this may take a while) ---')
+                    while True:
+                        if cancel_event.is_set() or _job_cancel_requested(job_id):
+                            cancelled = True
+                            log('--- Cancelled by user ---')
+                            break
+                        if _pregen_sleep(8, job_id, cancel_event):
+                            cancelled = True
+                            log('--- Cancelled by user ---')
+                            break
+                        try:
+                            out = rcon('chunky progress')
+                        except RCONError as e:
+                            log(f'RCON error: {e}')
+                            break
+                        if any(x in out for x in ('100%', '100.00%', 'no tasks', 'no task', 'finished', 'complete')):
+                            log('--- Pre-generation complete ---')
+                            break
 
     except Exception as e:
         set_status('error', str(e))
-        if proc and proc.poll() is None:
-            proc.kill()
-            proc.wait()
+    else:
+        if cancelled:
+            set_status('cancelled')
+        else:
+            set_status('done')
+    finally:
+        if proc is not None and proc.poll() is None:
+            _stop_background_mc(proc, cfg, log, cancelled=cancelled)
+        with _pregen_handles_lock:
+            _pregen_handles.pop(job_id, None)
 
 
 @app.route('/api/worlds/<name>/pregen', methods=['POST'])
@@ -1325,9 +1696,8 @@ def start_pregen(name):
     if not world_dir.is_dir():
         return jsonify({'error': 'World not found'}), 404
 
-    with _server_lock:
-        if _server_proc is not None and _server_proc.poll() is None:
-            return jsonify({'error': 'Stop the running server before pre-generating'}), 400
+    if _managed_server_running():
+        return jsonify({'error': 'Stop the running server before pre-generating'}), 400
 
     data = request.get_json() or {}
     try:
@@ -1337,12 +1707,16 @@ def start_pregen(name):
     except (TypeError, ValueError):
         return jsonify({'error': 'Invalid coordinates or radius'}), 400
 
-    if radius < 100 or radius > 50000:
-        return jsonify({'error': 'Radius must be between 100 and 50000 blocks'}), 400
+    if radius < 100 or radius > 10000:
+        return jsonify({'error': 'Radius must be between 100 and 10000 blocks'}), 400
 
-    job_id = str(uuid.uuid4())
-    with _jobs_lock:
-        _jobs[job_id] = {'status': 'running', 'log': [], 'error': None}
+    job_id = _try_reserve_job(name, 'pregen')
+    if not job_id:
+        if _managed_server_running():
+            return jsonify({'error': 'Stop the running server before pre-generating'}), 400
+        return jsonify({
+            'error': 'Pre-generation or another background server task is already running',
+        }), 400
 
     t = threading.Thread(
         target=_run_pregen,
@@ -1353,12 +1727,25 @@ def start_pregen(name):
     return jsonify({'job_id': job_id})
 
 
+@app.route('/api/worlds/<name>/pregen/<job_id>/cancel', methods=['POST'])
+@require_auth
+def cancel_pregen(name, job_id):
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job or job.get('world') != name or job.get('type') != 'pregen':
+            return jsonify({'error': 'Job not found'}), 404
+        if job['status'] != 'running':
+            return jsonify({'error': 'Job is not running'}), 400
+    _request_job_cancel(job_id)
+    return jsonify({'ok': True})
+
+
 @app.route('/api/worlds/<name>/pregen/<job_id>')
 @require_auth
 def pregen_status(name, job_id):
     with _jobs_lock:
         job = _jobs.get(job_id)
-    if not job:
+    if not job or job.get('world') != name:
         return jsonify({'error': 'Job not found'}), 404
     return jsonify(job)
 
@@ -1417,12 +1804,13 @@ def rcon_give(name):
     if not cfg['enabled'] or not cfg['password']:
         return jsonify({'error': 'RCON not configured'}), 400
     try:
-        # 1.20.5–1.21.4: dedicated painting_variant item component
         cmd = f'give {player} minecraft:painting[minecraft:painting_variant={PAINTINGS_NS}:{painting}]'
         raw = _rcon_exec('localhost', cfg['port'], cfg['password'], cmd)
         if 'Unknown item component' in raw:
-            # 1.21.5+: component removed; specify variant via entity NBT
-            cmd = f'give {player} minecraft:painting[minecraft:entity_data={{id:"minecraft:painting",variant:"{PAINTINGS_NS}:{painting}"}}]'
+            cmd = (
+                f'give {player} minecraft:painting[minecraft:entity_data='
+                f'{{id:"minecraft:painting",variant:"{PAINTINGS_NS}:{painting}"}}]'
+            )
             raw = _rcon_exec('localhost', cfg['port'], cfg['password'], cmd)
         return jsonify({'ok': True, 'response': re.sub(r'§.', '', raw)})
     except RCONError as e:
@@ -1435,6 +1823,8 @@ def ensure_rcon_endpoint(name):
     world_dir = safe_child(WORLDS_DIR, name)
     if not world_dir.is_dir():
         return jsonify({'error': 'World not found'}), 404
+    if _world_dir_busy(name):
+        return jsonify({'error': 'A background job is running for this world'}), 400
     if not (world_dir / 'server.properties').exists():
         return jsonify({'error': 'server.properties not found — start the server once to generate it'}), 404
     _ensure_rcon(world_dir)
@@ -1586,21 +1976,30 @@ def upload_server_icon():
     ext = Path(file.filename).suffix.lower()
     if ext not in _IMAGE_EXTS:
         return jsonify({'error': 'Only PNG/JPEG images allowed'}), 400
+    if not _icon_lock.acquire(blocking=False):
+        return jsonify({'error': 'Server icon update already in progress'}), 409
     try:
         _save_server_icon_file(file.stream)
         _apply_server_icon_all()
         return jsonify({'ok': True})
     except Exception as e:
         return jsonify({'error': f'Invalid image: {e}'}), 400
+    finally:
+        _icon_lock.release()
 
 
 @app.route('/api/server-icon', methods=['DELETE'])
 @require_auth
 def delete_server_icon():
-    if SERVER_ICON_FILE.is_file():
-        SERVER_ICON_FILE.unlink()
-    _remove_server_icon_all()
-    return jsonify({'ok': True})
+    if not _icon_lock.acquire(blocking=False):
+        return jsonify({'error': 'Server icon update already in progress'}), 409
+    try:
+        if SERVER_ICON_FILE.is_file():
+            SERVER_ICON_FILE.unlink()
+        _remove_server_icon_all()
+        return jsonify({'ok': True})
+    finally:
+        _icon_lock.release()
 
 
 # ─── Config ───────────────────────────────────────────────────────────────────
@@ -1620,23 +2019,28 @@ def get_config_endpoint():
 @app.route('/api/config', methods=['POST'])
 @require_auth
 def save_config_endpoint():
-    data = request.get_json() or {}
-    config = load_config()
-    if 'server_host' in data:
-        config['server_host'] = data['server_host'].strip()
-    if 'public_port' in data:
-        try:
-            port = int(data['public_port'])
-            if port < 1 or port > 65535:
-                raise ValueError
-            config['public_port'] = port
-        except (ValueError, TypeError):
-            return jsonify({'error': 'Invalid port'}), 400
-    if 'jvm_args' in data:
-        config['jvm_args'] = str(data['jvm_args']).strip()
-    save_config(config)
-    rebuilt = rebuild_paintings_all()
-    return jsonify({'ok': True, 'rebuilt_worlds': rebuilt})
+    if not _config_lock.acquire(blocking=False):
+        return jsonify({'error': 'Settings save already in progress'}), 409
+    try:
+        data = request.get_json() or {}
+        config = load_config()
+        if 'server_host' in data:
+            config['server_host'] = data['server_host'].strip()
+        if 'public_port' in data:
+            try:
+                port = int(data['public_port'])
+                if port < 1 or port > 65535:
+                    raise ValueError
+                config['public_port'] = port
+            except (ValueError, TypeError):
+                return jsonify({'error': 'Invalid port'}), 400
+        if 'jvm_args' in data:
+            config['jvm_args'] = str(data['jvm_args']).strip()
+        CONFIG_FILE.write_text(json.dumps(config, indent=2))
+        rebuilt = rebuild_paintings_all()
+        return jsonify({'ok': True, 'rebuilt_worlds': rebuilt})
+    finally:
+        _config_lock.release()
 
 
 # ─── Jars ────────────────────────────────────────────────────────────────────
@@ -1659,6 +2063,9 @@ def list_jars():
 @app.route('/api/jars/update', methods=['POST'])
 @require_auth
 def update_jar():
+    if _mc_port_busy():
+        return jsonify({'error': 'Stop the server and background tasks before updating the jar'}), 400
+
     data = request.get_json() or {}
     url = data.get('url', '').strip()
     if not url.startswith('https://'):
@@ -1675,7 +2082,7 @@ def update_jar():
                     tmp.write(chunk)
 
         final = JARS_DIR / 'server.jar'
-        tmp_path.rename(final)
+        tmp_path.replace(final)
         tmp_path = None
         for old in JARS_DIR.glob('*.jar'):
             if old != final:
@@ -1706,6 +2113,8 @@ def save_motd():
     world_dir = _active_world_dir()
     if not world_dir:
         return jsonify({'error': 'No active world'}), 404
+    if _world_dir_busy(world_dir.name):
+        return jsonify({'error': 'A background job is running for the active world'}), 400
     if not (world_dir / 'server.properties').exists():
         return jsonify({'error': 'server.properties not found'}), 404
     motd = (request.get_json() or {}).get('motd', '')
@@ -1858,6 +2267,8 @@ def start_server():
     with _server_lock:
         if _server_proc is not None and _server_proc.poll() is None:
             return jsonify({'error': 'Server is already running'}), 400
+        if _background_mc_jobs_running():
+            return jsonify({'error': 'A background server task is running — wait for it to finish'}), 400
 
     config = load_config()
     active_world = config.get('active_world')
@@ -1895,7 +2306,20 @@ def start_server():
     with _server_lock:
         if _server_proc is not None and _server_proc.poll() is None:
             proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
             return jsonify({'error': 'Server is already running'}), 400
+        if _background_mc_jobs_running():
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            return jsonify({'error': 'A background server task started — try again'}), 400
         _server_proc = proc
         _server_start_time = time.time()
     return jsonify({'ok': True})
@@ -1905,6 +2329,11 @@ def start_server():
 @require_auth
 def stop_server():
     global _server_proc, _server_start_time
+    if _background_mc_jobs_running():
+        return jsonify({
+            'error': 'A background server task is running — cancel or wait for it to finish first',
+        }), 400
+
     config = load_config()
     active_world = config.get('active_world')
 
@@ -1923,8 +2352,15 @@ def stop_server():
         proc = _server_proc
         _server_proc = None
         _server_start_time = None
-        if proc is not None and proc.poll() is None and not rcon_sent:
+
+    if proc is not None and proc.poll() is None:
+        if not rcon_sent:
             proc.terminate()
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
 
     return jsonify({'ok': True})
 

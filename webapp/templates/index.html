@@ -304,7 +304,7 @@
         <button class="modal-close" data-close="pregenModal">✕</button>
       </div>
       <p class="images-hint" style="margin:0 1.25rem 0.75rem">
-        Requires a <strong>Paper</strong> server jar. Stop the server before starting. Generates terrain ahead of time so flying is smoother.
+        Requires a <strong>Paper</strong> server jar. Stop the server before starting. Works on worlds you have already played — only missing chunks are generated. Use <strong>Cancel Pre-gen</strong> to stop and shut down the background server.
       </p>
       <div class="generate-form">
         <label>Center X
@@ -314,7 +314,7 @@
           <input type="number" id="pregenCenterZ" value="0" />
         </label>
         <label>Radius (blocks)
-          <input type="number" id="pregenRadius" value="1000" min="100" max="50000" />
+          <input type="number" id="pregenRadius" value="1000" min="100" max="10000" />
         </label>
       </div>
       <div id="pregenLog" class="generate-log hidden"></div>
