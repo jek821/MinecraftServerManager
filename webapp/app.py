@@ -31,7 +31,7 @@ WORLDS_DIR = BASE_DIR / 'worldFiles'
 JARS_DIR = BASE_DIR / 'jars'
 CONFIG_FILE = BASE_DIR / 'config.json'
 FLASK_HOST = '127.0.0.1'
-FLASK_PORT = 5000
+FLASK_PORT = 17891  # internal only — proxied via public_port
 DEFAULT_PUBLIC_PORT = 25565
 DEFAULT_MC_INTERNAL_PORT = 25566
 _IMAGE_EXTS = ('.png', '.jpg', '.jpeg')
@@ -99,12 +99,25 @@ def load_config() -> dict:
         'public_port': DEFAULT_PUBLIC_PORT,
         'mc_internal_port': DEFAULT_MC_INTERNAL_PORT,
     }
+    dirty = False
     if CONFIG_FILE.exists():
         saved = json.loads(CONFIG_FILE.read_text())
         defaults.update(saved)
-        # Migrate old config key
-        if 'port' in saved and 'public_port' not in saved:
-            defaults['public_port'] = saved['port']
+        # Legacy "port" was the old Flask/resource-pack port — not the public MC port.
+        if 'port' in saved:
+            defaults.pop('port', None)
+            dirty = True
+    public = int(defaults.get('public_port', DEFAULT_PUBLIC_PORT))
+    internal = int(defaults.get('mc_internal_port', DEFAULT_MC_INTERNAL_PORT))
+    reserved = {FLASK_PORT, internal}
+    if public in reserved or public == 5000:
+        defaults['public_port'] = DEFAULT_PUBLIC_PORT
+        dirty = True
+    if internal == defaults['public_port']:
+        defaults['mc_internal_port'] = DEFAULT_MC_INTERNAL_PORT
+        dirty = True
+    if dirty:
+        save_config({k: v for k, v in defaults.items() if k != 'port'})
     return defaults
 
 
@@ -1363,6 +1376,12 @@ if __name__ == '__main__':
         http_host=FLASK_HOST,
         http_port=FLASK_PORT,
     )
+    if public in (FLASK_PORT, internal):
+        raise SystemExit(
+            f'Config error: public_port ({public}) conflicts with internal ports. '
+            f'Use {DEFAULT_PUBLIC_PORT} for players and delete config.json to reset.'
+        )
     print(f'Public port {public}: Minecraft + resource packs + web UI')
     print(f'Minecraft binds internally on port {internal}')
+    print(f'Flask (internal): {FLASK_HOST}:{FLASK_PORT}')
     app.run(host=FLASK_HOST, port=FLASK_PORT, debug=False)
