@@ -114,6 +114,7 @@ function buildWorldCard(w) {
       <button class="btn btn-secondary" data-action="download" data-world="${esc(w.name)}">Download</button>
       ${w.has_properties ? `<button class="btn btn-secondary" data-action="properties" data-world="${esc(w.name)}">Properties</button>` : ''}
       <button class="btn btn-secondary" data-action="images" data-world="${esc(w.name)}">Images</button>
+      <button class="btn btn-secondary" data-action="pregen"  data-world="${esc(w.name)}">Pre-gen</button>
       <button class="btn btn-danger"    data-action="delete"  data-world="${esc(w.name)}">Delete</button>
     </div>
   `;
@@ -135,6 +136,7 @@ document.getElementById('worldsGrid').addEventListener('click', async (e) => {
   if (action === 'download')    downloadWorld(name);
   if (action === 'properties')  await openProperties(name);
   if (action === 'images')      await openImages(name);
+  if (action === 'pregen')      openPregen(name);
   if (action === 'delete')      openDeleteConfirm(name);
   if (action === 'rename')      startRename(btn, name);
 });
@@ -462,6 +464,83 @@ document.getElementById('startGenerateBtn').addEventListener('click', async () =
     appendLog(['Error starting generation: ' + err.message]);
     document.getElementById('startGenerateBtn').disabled = false;
     document.getElementById('cancelGenerateBtn').dataset.close = 'generateModal';
+  }
+});
+
+// ── Pre-generate ──────────────────────────────────────────────────────────────
+let _pregenWorld = null;
+let _pregenPoll = null;
+
+function openPregen(name) {
+  _pregenWorld = name;
+  document.getElementById('pregenModalTitle').textContent = `Pre-generate — ${name}`;
+  document.getElementById('pregenCenterX').value = '0';
+  document.getElementById('pregenCenterZ').value = '0';
+  document.getElementById('pregenRadius').value = '1000';
+  const logEl = document.getElementById('pregenLog');
+  logEl.textContent = '';
+  logEl.classList.add('hidden');
+  document.getElementById('startPregenBtn').disabled = false;
+  document.getElementById('startPregenBtn').textContent = 'Start Pre-gen';
+  document.getElementById('cancelPregenBtn').dataset.close = 'pregenModal';
+  openModal('pregenModal');
+}
+
+document.getElementById('startPregenBtn').addEventListener('click', async () => {
+  if (!_pregenWorld) return;
+  const logEl = document.getElementById('pregenLog');
+  logEl.textContent = '';
+  logEl.classList.remove('hidden');
+  document.getElementById('startPregenBtn').disabled = true;
+  document.getElementById('cancelPregenBtn').removeAttribute('data-close');
+
+  const center_x = parseInt(document.getElementById('pregenCenterX').value, 10) || 0;
+  const center_z = parseInt(document.getElementById('pregenCenterZ').value, 10) || 0;
+  const radius = parseInt(document.getElementById('pregenRadius').value, 10) || 1000;
+
+  function appendLog(lines) {
+    logEl.textContent += lines.join('\n') + '\n';
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  try {
+    const { job_id } = await apiJson('POST', `/api/worlds/${encodeURIComponent(_pregenWorld)}/pregen`, {
+      center_x, center_z, radius,
+    });
+
+    let lastLogLen = 0;
+    if (_pregenPoll) clearInterval(_pregenPoll);
+    _pregenPoll = setInterval(async () => {
+      try {
+        const job = await apiJson('GET', `/api/worlds/${encodeURIComponent(_pregenWorld)}/pregen/${job_id}`);
+        const newLines = job.log.slice(lastLogLen);
+        if (newLines.length) appendLog(newLines);
+        lastLogLen = job.log.length;
+
+        if (job.status === 'done') {
+          clearInterval(_pregenPoll);
+          appendLog(['', '✔ Pre-generation complete.']);
+          document.getElementById('startPregenBtn').disabled = false;
+          document.getElementById('startPregenBtn').textContent = 'Start Pre-gen';
+          document.getElementById('cancelPregenBtn').dataset.close = 'pregenModal';
+        } else if (job.status === 'error') {
+          clearInterval(_pregenPoll);
+          appendLog(['', '✘ Error: ' + job.error]);
+          document.getElementById('startPregenBtn').disabled = false;
+          document.getElementById('startPregenBtn').textContent = 'Start Pre-gen';
+          document.getElementById('cancelPregenBtn').dataset.close = 'pregenModal';
+        }
+      } catch {
+        clearInterval(_pregenPoll);
+        appendLog(['Poll error — check server.']);
+        document.getElementById('startPregenBtn').disabled = false;
+        document.getElementById('cancelPregenBtn').dataset.close = 'pregenModal';
+      }
+    }, 1500);
+  } catch (err) {
+    appendLog(['Error: ' + err.message]);
+    document.getElementById('startPregenBtn').disabled = false;
+    document.getElementById('cancelPregenBtn').dataset.close = 'pregenModal';
   }
 });
 

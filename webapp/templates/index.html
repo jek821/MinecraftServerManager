@@ -147,6 +147,7 @@
               <a href="https://jars.vexyhost.com/" target="_blank" rel="noopener">jars.vexyhost.com</a>,
               find the version you want, then <strong>right-click the blue Download button</strong>
               and choose <em>Copy link address</em>. Paste it below.
+              For chunk pre-generation, use a <strong>Paper</strong> jar (not vanilla).
             </span>
           </div>
           <div class="input-row">
@@ -291,6 +292,35 @@
       <div class="modal-footer">
         <button class="btn btn-ghost" id="cancelGenerateBtn" data-close="generateModal">Cancel</button>
         <button class="btn btn-primary" id="startGenerateBtn">Generate</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Pre-generate Modal -->
+  <div id="pregenModal" class="modal-overlay hidden">
+    <div class="modal modal-wide">
+      <div class="modal-header">
+        <h3 id="pregenModalTitle">Pre-generate Chunks</h3>
+        <button class="modal-close" data-close="pregenModal">✕</button>
+      </div>
+      <p class="images-hint" style="margin:0 1.25rem 0.75rem">
+        Requires a <strong>Paper</strong> server jar. Stop the server before starting. Generates terrain ahead of time so flying is smoother.
+      </p>
+      <div class="generate-form">
+        <label>Center X
+          <input type="number" id="pregenCenterX" value="0" />
+        </label>
+        <label>Center Z
+          <input type="number" id="pregenCenterZ" value="0" />
+        </label>
+        <label>Radius (blocks)
+          <input type="number" id="pregenRadius" value="1000" min="100" max="50000" />
+        </label>
+      </div>
+      <div id="pregenLog" class="generate-log hidden"></div>
+      <div class="modal-footer">
+        <button class="btn btn-ghost" id="cancelPregenBtn" data-close="pregenModal">Cancel</button>
+        <button class="btn btn-primary" id="startPregenBtn">Start Pre-gen</button>
       </div>
     </div>
   </div>

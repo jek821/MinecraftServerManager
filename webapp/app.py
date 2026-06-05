@@ -1165,6 +1165,200 @@ def generate_status(job_id):
     return jsonify(job)
 
 
+# ─── Chunk pre-generation (Paper + Chunky) ───────────────────────────────────
+
+CHUNKY_JAR_URL = 'https://github.com/pop4959/Chunky/releases/download/3.6.6/Chunky-3.6.6.jar'
+
+
+def _ensure_chunky_plugin(world_dir: Path) -> Path:
+    plugins_dir = world_dir / 'plugins'
+    plugins_dir.mkdir(exist_ok=True)
+    dest = plugins_dir / 'Chunky.jar'
+    if dest.exists():
+        return dest
+    with requests.get(CHUNKY_JAR_URL, stream=True, timeout=120) as r:
+        r.raise_for_status()
+        dest.write_bytes(r.content)
+    return dest
+
+
+def _run_pregen(job_id: str, world_name: str, center_x: int, center_z: int, radius: int):
+    jar = JARS_DIR / 'server.jar'
+    config = load_config()
+    java_cmd = config.get('java_cmd', 'java')
+    jvm_args = shlex.split(config.get('jvm_args', _AIKAR_FLAGS))
+    world_dir = WORLDS_DIR / world_name
+
+    def log(msg: str):
+        with _jobs_lock:
+            _jobs[job_id]['log'].append(msg)
+
+    def set_status(status: str, error: str | None = None):
+        with _jobs_lock:
+            _jobs[job_id]['status'] = status
+            if error:
+                _jobs[job_id]['error'] = error
+
+    proc = None
+    try:
+        if not world_dir.is_dir():
+            raise RuntimeError(f'World "{world_name}" not found')
+        if not jar.exists():
+            raise RuntimeError('server.jar not found in jars/ directory')
+
+        log('Downloading Chunky plugin (if needed)…')
+        _ensure_chunky_plugin(world_dir)
+        log('Chunky plugin ready.')
+
+        (world_dir / 'eula.txt').write_text('eula=true\n')
+        if (world_dir / 'server.properties').exists():
+            _ensure_mc_internal_port(world_dir)
+            _ensure_rcon(world_dir)
+        else:
+            raise RuntimeError('server.properties not found — start the server once first')
+
+        level = get_level_name(world_dir)
+        log(f'Pre-generating world "{level}" — center ({center_x}, {center_z}), radius {radius} blocks')
+        log('Requires a Paper server jar (vanilla will not work).')
+        log(f'Starting server: {java_cmd} -jar {jar.name} --nogui')
+
+        proc = subprocess.Popen(
+            [java_cmd, *jvm_args, '-jar', str(jar), '--nogui'],
+            cwd=str(world_dir),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+
+        assert proc.stdout
+        ready = False
+        for line in proc.stdout:
+            line = line.rstrip()
+            log(line)
+            if 'Done (' in line:
+                ready = True
+                break
+
+        if not ready:
+            raise RuntimeError('Server exited before finishing startup')
+
+        log('Waiting for plugins to load…')
+        time.sleep(4)
+
+        cfg = _rcon_settings(world_dir)
+        if not cfg['enabled'] or not cfg['password']:
+            raise RuntimeError('RCON not configured')
+
+        def rcon(cmd: str) -> str:
+            resp = _rcon_exec('localhost', cfg['port'], cfg['password'], cmd)
+            clean = re.sub(r'§.', '', resp).strip()
+            log(f'> {cmd}')
+            if clean:
+                log(clean)
+            return clean.lower()
+
+        for cmd in (
+            f'chunky world {level}',
+            f'chunky center {center_x} {center_z}',
+            f'chunky radius {radius}',
+            'chunky start',
+        ):
+            out = rcon(cmd)
+            if any(x in out for x in ('unknown command', 'not found', 'no such command', 'error')):
+                raise RuntimeError(
+                    'Chunky command failed — install a Paper server jar from Update Server Version'
+                )
+
+        log('--- Pre-generation running (this may take a while) ---')
+        while True:
+            time.sleep(8)
+            try:
+                out = rcon('chunky progress')
+            except RCONError as e:
+                log(f'RCON error: {e}')
+                break
+            if any(x in out for x in ('100%', '100.00%', 'no tasks', 'no task', 'finished', 'complete')):
+                log('--- Pre-generation complete ---')
+                break
+
+        try:
+            rcon('chunky cancel')
+        except RCONError:
+            pass
+        try:
+            _rcon_exec('localhost', cfg['port'], cfg['password'], 'stop')
+        except RCONError:
+            if proc.stdin:
+                try:
+                    proc.stdin.write('stop\n')
+                    proc.stdin.flush()
+                except OSError:
+                    proc.terminate()
+
+        for line in proc.stdout:
+            log(line.rstrip())
+
+        try:
+            proc.wait(timeout=90)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+        set_status('done')
+
+    except Exception as e:
+        set_status('error', str(e))
+        if proc and proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
+@app.route('/api/worlds/<name>/pregen', methods=['POST'])
+@require_auth
+def start_pregen(name):
+    world_dir = safe_child(WORLDS_DIR, name)
+    if not world_dir.is_dir():
+        return jsonify({'error': 'World not found'}), 404
+
+    with _server_lock:
+        if _server_proc is not None and _server_proc.poll() is None:
+            return jsonify({'error': 'Stop the running server before pre-generating'}), 400
+
+    data = request.get_json() or {}
+    try:
+        center_x = int(data.get('center_x', 0))
+        center_z = int(data.get('center_z', 0))
+        radius = int(data.get('radius', 1000))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'Invalid coordinates or radius'}), 400
+
+    if radius < 100 or radius > 50000:
+        return jsonify({'error': 'Radius must be between 100 and 50000 blocks'}), 400
+
+    job_id = str(uuid.uuid4())
+    with _jobs_lock:
+        _jobs[job_id] = {'status': 'running', 'log': [], 'error': None}
+
+    t = threading.Thread(
+        target=_run_pregen,
+        args=(job_id, name, center_x, center_z, radius),
+        daemon=True,
+    )
+    t.start()
+    return jsonify({'job_id': job_id})
+
+
+@app.route('/api/worlds/<name>/pregen/<job_id>')
+@require_auth
+def pregen_status(name, job_id):
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if not job:
+        return jsonify({'error': 'Job not found'}), 404
+    return jsonify(job)
+
+
 # ─── Detect host ─────────────────────────────────────────────────────────────
 
 @app.route('/api/detect-host')
