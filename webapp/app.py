@@ -1496,6 +1496,7 @@ if __name__ == '__main__':
         http_host=FLASK_HOST,
         http_port=FLASK_PORT,
         ssl_context=tls_ctx,
+        worlds_dir=WORLDS_DIR,
     )
     print(f'Public port {public}: Minecraft + resource packs + web UI')
     print(f'Minecraft binds internally on port {internal}')
