@@ -23,7 +23,7 @@ from PIL import Image as PILImage
 app = Flask(__name__)
 
 # BASE_DIR must be defined before _load_secret_key so the .secret_key path resolves
-BASE_DIR = Path('/home/jemanuel/minecraftServerManager')
+BASE_DIR = Path(__file__).resolve().parent.parent
 WORLDS_DIR = BASE_DIR / 'worldFiles'
 JARS_DIR = BASE_DIR / 'jars'
 CONFIG_FILE = BASE_DIR / 'config.json'
