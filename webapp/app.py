@@ -34,6 +34,7 @@ JARS_DIR = BASE_DIR / 'jars'
 CONFIG_FILE = BASE_DIR / 'config.json'
 FLASK_HOST = '127.0.0.1'
 FLASK_PORT = 17891  # internal only — proxied via public_port
+PACK_PORT = 17892     # dedicated resource-pack HTTP server
 DEFAULT_PUBLIC_PORT = 25565
 DEFAULT_MC_INTERNAL_PORT = 25566
 _IMAGE_EXTS = ('.png', '.jpg', '.jpeg')
@@ -111,7 +112,7 @@ def load_config() -> dict:
             dirty = True
     public = int(defaults.get('public_port', DEFAULT_PUBLIC_PORT))
     internal = int(defaults.get('mc_internal_port', DEFAULT_MC_INTERNAL_PORT))
-    reserved = {FLASK_PORT, internal}
+    reserved = {FLASK_PORT, PACK_PORT, internal}
     if public in reserved or public == 5000:
         defaults['public_port'] = DEFAULT_PUBLIC_PORT
         dirty = True
@@ -1485,7 +1486,7 @@ if __name__ == '__main__':
             print(f'TLS enabled for resource packs (host: {host})')
         except Exception as e:
             print(f'Warning: TLS cert generation failed ({e}) — HTTPS packs may not work')
-    if public in (FLASK_PORT, internal):
+    if public in (FLASK_PORT, PACK_PORT, internal):
         raise SystemExit(
             f'Config error: public_port ({public}) conflicts with internal ports. '
             f'Use {DEFAULT_PUBLIC_PORT} for players and delete config.json to reset.'
@@ -1493,8 +1494,9 @@ if __name__ == '__main__':
     start_port_proxy(
         public_port=public,
         mc_port=internal,
-        http_host=FLASK_HOST,
-        http_port=FLASK_PORT,
+        flask_host=FLASK_HOST,
+        flask_port=FLASK_PORT,
+        pack_port=PACK_PORT,
         ssl_context=tls_ctx,
         worlds_dir=WORLDS_DIR,
     )

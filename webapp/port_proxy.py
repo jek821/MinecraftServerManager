@@ -1,29 +1,25 @@
-"""TCP multiplexer: route port 25565 to Minecraft (internal) or HTTP handlers.
-
-Resource pack downloads are served directly (avoids proxy truncation that causes
-Minecraft's "Premature EOF"). Other HTTP traffic is forwarded to Flask.
-"""
+"""TCP multiplexer: port 25565 → Minecraft, resource-pack HTTP, or Flask web UI."""
 
 from __future__ import annotations
 
-import re
 import socket
 import ssl
 import threading
 from pathlib import Path
+from urllib.parse import urlparse
+
+from pack_server import _world_from_path
 
 _HTTP_PREFIXES = (
     b'GET ', b'POST ', b'HEAD ', b'PUT ', b'DELETE ',
     b'OPTIONS ', b'PATCH ', b'CONNECT ', b'TRACE ',
 )
 
-_PACK_PATH = re.compile(r'^/resourcepack/([A-Za-z0-9_\-]+)\.zip$')
-
 
 def _is_http_peek(sock: socket.socket) -> bool:
     try:
-        peek = sock.recv(8, socket.MSG_PEEK)
-        return any(peek.startswith(p) for p in _HTTP_PREFIXES)
+        peek = sock.recv(16, socket.MSG_PEEK)
+        return any(peek.startswith(p) for p in _HTTP_PREFIXES) or peek.startswith(b'PRI ')
     except OSError:
         return False
 
@@ -56,39 +52,7 @@ def _parse_http(buf: bytes) -> tuple[str, str]:
     return parts[0].upper(), parts[1]
 
 
-def _serve_resource_pack(sock: socket.socket, worlds_dir: Path, path: str, method: str) -> bool:
-    m = _PACK_PATH.match(path)
-    if not m:
-        return False
-    world_name = m.group(1)
-    pack = worlds_dir / world_name / '.resource_pack.zip'
-    if not pack.is_file():
-        sock.sendall(b'HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
-        return True
-    data = pack.read_bytes()
-    header = (
-        'HTTP/1.1 200 OK\r\n'
-        'Content-Type: application/zip\r\n'
-        f'Content-Length: {len(data)}\r\n'
-        f'Content-Disposition: attachment; filename="{world_name}_paintings.zip"\r\n'
-        'Connection: close\r\n'
-        '\r\n'
-    ).encode()
-    sock.sendall(header)
-    if method != 'HEAD':
-        view = memoryview(data)
-        offset = 0
-        while offset < len(data):
-            sent = sock.send(view[offset:offset + 262144])
-            if sent == 0:
-                break
-            offset += sent
-    return True
-
-
 def _relay_bidirectional(a: socket.socket, b: socket.socket) -> None:
-    """Threaded relay — more reliable than single-thread select for large downloads."""
-
     def pump(src: socket.socket, dst: socket.socket) -> None:
         try:
             while True:
@@ -117,14 +81,24 @@ def _relay_bidirectional(a: socket.socket, b: socket.socket) -> None:
             pass
 
 
+def _http_backend_port(path: str, pack_port: int, flask_port: int) -> int:
+    if _world_from_path(path):
+        return pack_port
+    # Absolute URI in request line
+    if path.startswith('http://') or path.startswith('https://'):
+        if _world_from_path(urlparse(path).path):
+            return pack_port
+    return flask_port
+
+
 def _handle_client(
     client: socket.socket,
     mc_host: str,
     mc_port: int,
-    http_host: str,
-    http_port: int,
+    flask_host: str,
+    flask_port: int,
+    pack_port: int,
     ssl_context: ssl.SSLContext | None,
-    worlds_dir: Path,
 ) -> None:
     try:
         client.settimeout(120)
@@ -135,14 +109,9 @@ def _handle_client(
 
         if _is_http_peek(client) or isinstance(client, ssl.SSLSocket):
             buf = _read_http_request(client)
-            method, path = _parse_http(buf)
-            if method in ('GET', 'HEAD') and _serve_resource_pack(client, worlds_dir, path, method):
-                try:
-                    client.close()
-                except OSError:
-                    pass
-                return
-            backend = socket.create_connection((http_host, http_port), timeout=30)
+            _method, path = _parse_http(buf)
+            dest_port = _http_backend_port(path, pack_port, flask_port)
+            backend = socket.create_connection((flask_host, dest_port), timeout=30)
             backend.sendall(buf)
             _relay_bidirectional(client, backend)
             return
@@ -161,10 +130,10 @@ def _listen_loop(
     public_port: int,
     mc_host: str,
     mc_port: int,
-    http_host: str,
-    http_port: int,
+    flask_host: str,
+    flask_port: int,
+    pack_port: int,
     ssl_context: ssl.SSLContext | None,
-    worlds_dir: Path,
 ) -> None:
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -174,7 +143,7 @@ def _listen_loop(
         client, _addr = listener.accept()
         threading.Thread(
             target=_handle_client,
-            args=(client, mc_host, mc_port, http_host, http_port, ssl_context, worlds_dir),
+            args=(client, mc_host, mc_port, flask_host, flask_port, pack_port, ssl_context),
             daemon=True,
         ).start()
 
@@ -182,17 +151,20 @@ def _listen_loop(
 def start_port_proxy(
     public_port: int = 25565,
     mc_port: int = 25566,
-    http_host: str = '127.0.0.1',
-    http_port: int = 5000,
+    flask_host: str = '127.0.0.1',
+    flask_port: int = 17891,
+    pack_port: int = 17892,
     public_host: str = '0.0.0.0',
     ssl_context: ssl.SSLContext | None = None,
     worlds_dir: Path | None = None,
 ) -> threading.Thread:
     if worlds_dir is None:
         raise ValueError('worlds_dir is required')
+    from pack_server import start_pack_server
+    start_pack_server(worlds_dir, flask_host, pack_port)
     thread = threading.Thread(
         target=_listen_loop,
-        args=(public_host, public_port, '127.0.0.1', mc_port, http_host, http_port, ssl_context, worlds_dir),
+        args=(public_host, public_port, '127.0.0.1', mc_port, flask_host, flask_port, pack_port, ssl_context),
         daemon=True,
         name='port-proxy',
     )
