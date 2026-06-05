@@ -189,7 +189,8 @@ function startRename(btn, name) {
 async function activateWorld(name) {
   try {
     await apiJson('POST', `/api/worlds/${encodeURIComponent(name)}/activate`);
-    await loadWorlds();
+    await Promise.all([loadWorlds(), loadServerStatus()]);
+    if (!document.getElementById('whitelistBody').classList.contains('hidden')) loadWhitelist();
   } catch (err) {
     alert('Error: ' + err.message);
   }
@@ -637,6 +638,10 @@ async function loadSettings() {
     _serverHost = cfg.server_host || '';
     document.getElementById('jvmArgs').value = cfg.jvm_args || '';
     refreshServerIconPreview(!!cfg.has_server_icon);
+    try {
+      const motd = await apiJson('GET', '/api/server/motd');
+      document.getElementById('motdInput').value = motd.motd || '';
+    } catch { /* no active world */ }
     if (_serverHost) {
       document.getElementById('serverHost').value = _serverHost;
     } else {
@@ -700,7 +705,9 @@ document.getElementById('saveSettingsBtn').addEventListener('click', async () =>
   const jvmArgs = document.getElementById('jvmArgs').value.trim();
   const statusEl = document.getElementById('settingsStatus');
   try {
+    const motd = document.getElementById('motdInput').value;
     const data = await apiJson('POST', '/api/config', { server_host: host, public_port: 25565, jvm_args: jvmArgs });
+    try { await apiJson('POST', '/api/server/motd', { motd }); } catch { /* no active world */ }
     _serverHost = host;
     const rebuilt = data.rebuilt_worlds || 0;
     statusEl.textContent = rebuilt
@@ -723,37 +730,77 @@ document.getElementById('logoutBtn').addEventListener('click', async () => {
 });
 
 // ── Server HUD ────────────────────────────────────────────────────────────────
+const START_LABEL = '▶ Start';
+const STOP_LABEL = '■ Stop';
+const STATUS_POLL_SLOW = 5000;
+const STATUS_POLL_FAST = 1000;
+
+let _lastServerStatus = { state: 'stopped', world: null };
+let _serverPending = null; // null | 'starting' | 'stopping'
+let _statusPollTimer = null;
+
+function scheduleStatusPoll(interval) {
+  if (_statusPollTimer) clearInterval(_statusPollTimer);
+  _statusPollTimer = setInterval(loadServerStatus, interval);
+}
+
 async function loadServerStatus() {
   try {
     const data = await apiJson('GET', '/api/server/status');
+    _lastServerStatus = data;
     updateServerHud(data);
   } catch { /* silent */ }
 }
 
 function updateServerHud(data) {
-  const dot           = document.getElementById('serverStatusDot');
-  const label         = document.getElementById('serverStatusText');
-  const startBtn      = document.getElementById('startServerBtn');
-  const stopBtn       = document.getElementById('stopServerBtn');
-  const giveHudBtn    = document.getElementById('givePaintingHudBtn');
+  const dot        = document.getElementById('serverStatusDot');
+  const label      = document.getElementById('serverStatusText');
+  const startBtn   = document.getElementById('startServerBtn');
+  const stopBtn    = document.getElementById('stopServerBtn');
+  const giveHudBtn = document.getElementById('givePaintingHudBtn');
 
   _activeWorld = data.world || null;
 
-  dot.className = 'server-status-dot ' + data.state;
+  if (_serverPending === 'starting' && data.state === 'running') _serverPending = null;
+  if (_serverPending === 'starting' && data.state === 'stopped') _serverPending = null;
+  if (_serverPending === 'stopping' && data.state === 'stopped') _serverPending = null;
 
-  const stateLabel = { running: 'RUNNING', starting: 'STARTING', stopped: 'STOPPED' }[data.state] || data.state.toUpperCase();
+  let displayState = data.state;
+  if (_serverPending === 'stopping' && data.state === 'running') displayState = 'stopping';
+  if (_serverPending === 'starting' && data.state === 'stopped') displayState = 'starting';
+
+  dot.className = 'server-status-dot ' + displayState;
+
+  const stateLabel = {
+    running: 'RUNNING', starting: 'STARTING', stopping: 'STOPPING', stopped: 'STOPPED',
+  }[displayState] || displayState.toUpperCase();
   label.textContent = data.world ? `${stateLabel} — ${data.world}` : stateLabel;
 
-  startBtn.disabled   = data.state !== 'stopped';
-  stopBtn.disabled    = data.state === 'stopped';
-  giveHudBtn.disabled = data.state !== 'running';
-  document.getElementById('manageOpsHudBtn').disabled = data.state !== 'running';
+  if (_serverPending === 'starting') {
+    startBtn.textContent = 'Starting…';
+    startBtn.disabled = true;
+    stopBtn.textContent = STOP_LABEL;
+    stopBtn.disabled = true;
+  } else if (_serverPending === 'stopping') {
+    stopBtn.textContent = 'Stopping…';
+    stopBtn.disabled = true;
+    startBtn.textContent = START_LABEL;
+    startBtn.disabled = true;
+  } else {
+    startBtn.textContent = START_LABEL;
+    stopBtn.textContent = STOP_LABEL;
+    startBtn.disabled = data.state !== 'stopped';
+    stopBtn.disabled = data.state === 'stopped';
+  }
+
+  const running = data.state === 'running' && !_serverPending;
+  giveHudBtn.disabled = !running;
+  document.getElementById('manageOpsHudBtn').disabled = !running;
 
   document.getElementById('statPlayers').textContent =
     data.players_online != null ? `${data.players_online} / ${data.players_max}` : '—';
   document.getElementById('statUptime').textContent  = fmtUptime(data.uptime);
   document.getElementById('statVersion').textContent = data.version || '—';
-  document.getElementById('statPort').textContent    = data.mc_port || '—';
 
   const m = data.metrics;
   document.getElementById('statJvmRam').textContent = m ? fmtBytes(m.rss_kb * 1024) : '—';
@@ -761,32 +808,62 @@ function updateServerHud(data) {
     ? `${fmtBytes(m.sys_mem_used_kb * 1024)} / ${fmtBytes(m.sys_mem_total_kb * 1024)}`
     : '—';
   document.getElementById('statCpu').textContent = m != null ? m.cpu_pct + '%' : '—';
+
+  const addrEl = document.getElementById('serverAddress');
+  const copyBtn = document.getElementById('copyAddressBtn');
+  if (data.server_address) {
+    addrEl.textContent = data.server_address;
+    copyBtn.disabled = false;
+  } else {
+    addrEl.textContent = 'Set Server Host in Settings';
+    copyBtn.disabled = true;
+  }
+
+  scheduleStatusPoll(_serverPending ? STATUS_POLL_FAST : STATUS_POLL_SLOW);
+  if (data.state === 'running' && !_serverPending && !document.getElementById('serverLogsBody').classList.contains('hidden')) {
+    loadServerLogs();
+  }
 }
 
+document.getElementById('copyAddressBtn').addEventListener('click', async () => {
+  const addr = document.getElementById('serverAddress').textContent;
+  if (!addr || addr.startsWith('Set ')) return;
+  try {
+    await navigator.clipboard.writeText(addr);
+    const btn = document.getElementById('copyAddressBtn');
+    const prev = btn.textContent;
+    btn.textContent = 'Copied!';
+    setTimeout(() => { btn.textContent = prev; }, 1500);
+  } catch {
+    alert('Copy failed — select and copy manually: ' + addr);
+  }
+});
+
 document.getElementById('startServerBtn').addEventListener('click', async () => {
-  const btn = document.getElementById('startServerBtn');
-  btn.disabled = true;
-  btn.textContent = 'Starting…';
+  _serverPending = 'starting';
+  updateServerHud(_lastServerStatus);
   try {
     await apiJson('POST', '/api/server/start');
   } catch (err) {
+    _serverPending = null;
+    updateServerHud(_lastServerStatus);
     alert('Error: ' + err.message);
-    btn.textContent = '▶ Start';
-    btn.disabled = false;
+    return;
   }
   await loadServerStatus();
 });
 
 document.getElementById('stopServerBtn').addEventListener('click', async () => {
-  const btn = document.getElementById('stopServerBtn');
-  btn.disabled = true;
-  btn.textContent = 'Stopping…';
+  _serverPending = 'stopping';
+  updateServerHud(_lastServerStatus);
   try {
     await apiJson('POST', '/api/server/stop');
   } catch (err) {
+    _serverPending = null;
+    updateServerHud(_lastServerStatus);
     alert('Error: ' + err.message);
+    return;
   }
-  btn.textContent = '■ Stop';
   await loadServerStatus();
 });
 
@@ -907,8 +984,6 @@ document.getElementById('manageOpsHudBtn').addEventListener('click', async () =>
   await openOps(_activeWorld);
 });
 
-setInterval(loadServerStatus, 5000);
-
 // ── RCON Console ──────────────────────────────────────────────────────────────
 document.getElementById('rconSendBtn').addEventListener('click', sendRconCommand);
 document.getElementById('rconCmdInput').addEventListener('keydown', e => {
@@ -931,6 +1006,95 @@ async function sendRconCommand() {
   }
 }
 
+// ── Whitelist ─────────────────────────────────────────────────────────────────
+async function loadWhitelist() {
+  const list = document.getElementById('whitelistPlayers');
+  const checkbox = document.getElementById('whitelistEnabled');
+  try {
+    const data = await apiJson('GET', '/api/server/whitelist');
+    checkbox.checked = data.enabled;
+    if (!data.players.length) {
+      list.innerHTML = '<li class="hud-list-empty">No players whitelisted.</li>';
+    } else {
+      list.innerHTML = data.players.map(p => `
+        <li>
+          <span>${esc(p.name)}</span>
+          <button class="btn btn-danger btn-sm" data-whitelist-remove="${esc(p.name)}">✕</button>
+        </li>
+      `).join('');
+    }
+  } catch {
+    checkbox.checked = false;
+    list.innerHTML = '<li class="hud-list-empty">No active world.</li>';
+  }
+}
+
+function showWhitelistStatus(msg, ok) {
+  const el = document.getElementById('whitelistStatus');
+  el.textContent = msg;
+  el.className = 'status-text ' + (ok ? 'ok' : 'err');
+  el.classList.remove('hidden');
+  setTimeout(() => el.classList.add('hidden'), 3000);
+}
+
+document.getElementById('whitelistEnabled').addEventListener('change', async (e) => {
+  try {
+    await apiJson('POST', '/api/server/whitelist', { enabled: e.target.checked });
+    showWhitelistStatus(e.target.checked ? 'Whitelist enabled' : 'Whitelist disabled', true);
+  } catch (err) {
+    e.target.checked = !e.target.checked;
+    showWhitelistStatus(err.message, false);
+  }
+});
+
+document.getElementById('whitelistAddBtn').addEventListener('click', async () => {
+  const input = document.getElementById('whitelistAddInput');
+  const name = input.value.trim();
+  if (!name) return;
+  try {
+    await apiJson('POST', '/api/server/whitelist/add', { name });
+    input.value = '';
+    await loadWhitelist();
+    showWhitelistStatus(`Added ${name}`, true);
+  } catch (err) {
+    showWhitelistStatus(err.message, false);
+  }
+});
+
+document.getElementById('whitelistAddInput').addEventListener('keydown', e => {
+  if (e.key === 'Enter') document.getElementById('whitelistAddBtn').click();
+});
+
+document.getElementById('whitelistPlayers').addEventListener('click', async (e) => {
+  const btn = e.target.closest('[data-whitelist-remove]');
+  if (!btn) return;
+  const name = btn.dataset.whitelistRemove;
+  try {
+    await apiJson('DELETE', `/api/server/whitelist/${encodeURIComponent(name)}`);
+    await loadWhitelist();
+    showWhitelistStatus(`Removed ${name}`, true);
+  } catch (err) {
+    showWhitelistStatus(err.message, false);
+  }
+});
+
+// ── Server Logs ───────────────────────────────────────────────────────────────
+async function loadServerLogs() {
+  const output = document.getElementById('serverLogsOutput');
+  const pathEl = document.getElementById('serverLogsPath');
+  try {
+    const data = await apiJson('GET', '/api/server/logs?lines=300');
+    output.textContent = data.content || '(empty log file)';
+    pathEl.textContent = data.path || '';
+    output.scrollTop = output.scrollHeight;
+  } catch (err) {
+    output.textContent = err.message;
+    pathEl.textContent = '';
+  }
+}
+
+document.getElementById('refreshLogsBtn').addEventListener('click', loadServerLogs);
+
 // ── Collapsible sections ───────────────────────────────────────────────────────
 document.querySelectorAll('.collapsible-header').forEach(header => {
   header.addEventListener('click', () => {
@@ -939,6 +1103,8 @@ document.querySelectorAll('.collapsible-header').forEach(header => {
     const arrow = header.querySelector('.collapse-arrow');
     const collapsed = body.classList.toggle('hidden');
     if (arrow) arrow.textContent = collapsed ? '▸' : '▾';
+    if (bodyId === 'whitelistBody' && !collapsed) loadWhitelist();
+    if (bodyId === 'serverLogsBody' && !collapsed) loadServerLogs();
   });
 });
 

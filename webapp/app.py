@@ -571,6 +571,83 @@ def _ensure_mc_internal_port(world_dir: Path) -> None:
     })
 
 
+def _active_world_dir() -> Path | None:
+    name = load_config().get('active_world')
+    if not name:
+        return None
+    try:
+        world_dir = safe_child(WORLDS_DIR, name)
+    except ValueError:
+        return None
+    return world_dir if world_dir.is_dir() else None
+
+
+def _read_prop(world_dir: Path, key: str) -> str:
+    props = world_dir / 'server.properties'
+    if not props.exists():
+        return ''
+    for line in props.read_text().splitlines():
+        if '=' in line and not line.startswith('#'):
+            k, v = line.split('=', 1)
+            if k.strip() == key:
+                return v.strip()
+    return ''
+
+
+def _offline_player_uuid(name: str) -> str:
+    data = hashlib.md5(f'OfflinePlayer:{name}'.encode()).digest()
+    b = bytearray(data)
+    b[6] = (b[6] & 0x0f) | 0x30
+    b[8] = (b[8] & 0x3f) | 0x80
+    return str(uuid.UUID(bytes=bytes(b)))
+
+
+def _read_whitelist(world_dir: Path) -> list[dict]:
+    wl = world_dir / 'whitelist.json'
+    if not wl.exists():
+        return []
+    try:
+        return json.loads(wl.read_text())
+    except Exception:
+        return []
+
+
+def _write_whitelist(world_dir: Path, entries: list[dict]) -> None:
+    (world_dir / 'whitelist.json').write_text(json.dumps(entries, indent=2))
+
+
+def _whitelist_enabled(world_dir: Path) -> bool:
+    return _read_prop(world_dir, 'white-list').lower() == 'true'
+
+
+def _set_whitelist_enabled(world_dir: Path, enabled: bool) -> None:
+    val = 'true' if enabled else 'false'
+    _update_server_properties(world_dir, {'white-list': val, 'enforce-whitelist': val})
+
+
+def _server_address() -> str:
+    config = load_config()
+    host = config.get('server_host', '').strip() or get_local_ip()
+    return f'{host}:{_public_port()}' if host else ''
+
+
+def _rcon_on_active(command: str) -> str | None:
+    world_dir = _active_world_dir()
+    if not world_dir:
+        return None
+    cfg = _rcon_settings(world_dir)
+    if not cfg['enabled'] or not cfg['password']:
+        return None
+    try:
+        _mc_status_ping('localhost', _mc_internal_port())
+    except Exception:
+        return None
+    try:
+        return _rcon_exec('localhost', cfg['port'], cfg['password'], command)
+    except RCONError:
+        return None
+
+
 def _ensure_rcon(world_dir: Path) -> None:
     """Enable RCON in server.properties if not already set, generating a password if needed."""
     props_file = world_dir / 'server.properties'
@@ -1412,6 +1489,116 @@ def update_jar():
         return jsonify({'error': str(e)}), 500
 
 
+# ─── Server MOTD / whitelist / logs ──────────────────────────────────────────
+
+@app.route('/api/server/motd', methods=['GET'])
+@require_auth
+def get_motd():
+    world_dir = _active_world_dir()
+    if not world_dir:
+        return jsonify({'error': 'No active world'}), 404
+    if not (world_dir / 'server.properties').exists():
+        return jsonify({'motd': ''})
+    return jsonify({'motd': _read_prop(world_dir, 'motd')})
+
+
+@app.route('/api/server/motd', methods=['POST'])
+@require_auth
+def save_motd():
+    world_dir = _active_world_dir()
+    if not world_dir:
+        return jsonify({'error': 'No active world'}), 404
+    if not (world_dir / 'server.properties').exists():
+        return jsonify({'error': 'server.properties not found'}), 404
+    motd = (request.get_json() or {}).get('motd', '')
+    if not isinstance(motd, str):
+        return jsonify({'error': 'Invalid MOTD'}), 400
+    _update_server_properties(world_dir, {'motd': motd.strip()})
+    return jsonify({'ok': True})
+
+
+@app.route('/api/server/whitelist', methods=['GET'])
+@require_auth
+def get_whitelist():
+    world_dir = _active_world_dir()
+    if not world_dir:
+        return jsonify({'error': 'No active world'}), 404
+    players = [
+        {'name': e.get('name', ''), 'uuid': e.get('uuid', '')}
+        for e in _read_whitelist(world_dir) if e.get('name')
+    ]
+    return jsonify({'enabled': _whitelist_enabled(world_dir), 'players': players})
+
+
+@app.route('/api/server/whitelist', methods=['POST'])
+@require_auth
+def set_whitelist_enabled():
+    world_dir = _active_world_dir()
+    if not world_dir:
+        return jsonify({'error': 'No active world'}), 404
+    data = request.get_json() or {}
+    enabled = bool(data.get('enabled', False))
+    _set_whitelist_enabled(world_dir, enabled)
+    cmd = 'whitelist on' if enabled else 'whitelist off'
+    _rcon_on_active(cmd)
+    return jsonify({'ok': True, 'enabled': enabled})
+
+
+@app.route('/api/server/whitelist/add', methods=['POST'])
+@require_auth
+def whitelist_add():
+    world_dir = _active_world_dir()
+    if not world_dir:
+        return jsonify({'error': 'No active world'}), 404
+    player = (request.get_json() or {}).get('name', '').strip()
+    if not re.match(r'^[a-zA-Z0-9_]{1,16}$', player):
+        return jsonify({'error': 'Invalid player name'}), 400
+    entries = _read_whitelist(world_dir)
+    if any(e.get('name', '').lower() == player.lower() for e in entries):
+        return jsonify({'error': 'Player already whitelisted'}), 409
+    if _rcon_on_active(f'whitelist add {player}') is not None:
+        entries = _read_whitelist(world_dir)
+    else:
+        entries.append({'uuid': _offline_player_uuid(player), 'name': player})
+        _write_whitelist(world_dir, entries)
+    return jsonify({'ok': True})
+
+
+@app.route('/api/server/whitelist/<player>', methods=['DELETE'])
+@require_auth
+def whitelist_remove(player):
+    world_dir = _active_world_dir()
+    if not world_dir:
+        return jsonify({'error': 'No active world'}), 404
+    if not re.match(r'^[a-zA-Z0-9_]{1,16}$', player):
+        return jsonify({'error': 'Invalid player name'}), 400
+    if _rcon_on_active(f'whitelist remove {player}') is not None:
+        pass
+    else:
+        entries = [e for e in _read_whitelist(world_dir) if e.get('name', '').lower() != player.lower()]
+        _write_whitelist(world_dir, entries)
+    return jsonify({'ok': True})
+
+
+@app.route('/api/server/logs')
+@require_auth
+def get_server_logs():
+    world_dir = _active_world_dir()
+    if not world_dir:
+        return jsonify({'error': 'No active world'}), 404
+    log_file = world_dir / 'logs' / 'latest.log'
+    if not log_file.exists():
+        return jsonify({'content': '', 'path': str(log_file.relative_to(BASE_DIR))})
+    try:
+        lines = int(request.args.get('lines', 200))
+        lines = max(50, min(lines, 2000))
+    except ValueError:
+        lines = 200
+    content = log_file.read_text(errors='replace')
+    tail = '\n'.join(content.splitlines()[-lines:])
+    return jsonify({'content': tail, 'path': str(log_file.relative_to(BASE_DIR))})
+
+
 # ─── Server process management ───────────────────────────────────────────────
 
 @app.route('/api/server/status')
@@ -1451,12 +1638,13 @@ def get_server_status():
         state = 'stopped'
 
     metrics = _proc_metrics(proc.pid) if managed_running else None
+    addr = _server_address()
 
     return jsonify({
         'state': state,
         'world': active_world,
         'uptime': uptime,
-        'mc_port': public_port,
+        'server_address': addr or None,
         'players_online': ping['players_online'] if ping else None,
         'players_max': ping['players_max'] if ping else None,
         'version': ping['version'] if ping else None,

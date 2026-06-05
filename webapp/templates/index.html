@@ -34,6 +34,10 @@
         <span class="server-status-dot" id="serverStatusDot"></span>
         <span id="serverStatusText" class="server-status-label">Loading…</span>
       </div>
+      <div class="server-address-row">
+        <code id="serverAddress" class="server-address">—</code>
+        <button class="btn btn-secondary btn-sm" id="copyAddressBtn" type="button" disabled>Copy Address</button>
+      </div>
       <div class="server-stats" id="serverStats">
         <div class="stat-tile">
           <div class="stat-label">Players</div>
@@ -48,10 +52,6 @@
           <div class="stat-value" id="statVersion">—</div>
         </div>
         <div class="stat-tile">
-          <div class="stat-label">Port</div>
-          <div class="stat-value" id="statPort">—</div>
-        </div>
-        <div class="stat-tile">
           <div class="stat-label">JVM RAM</div>
           <div class="stat-value" id="statJvmRam">—</div>
         </div>
@@ -62,6 +62,39 @@
         <div class="stat-tile">
           <div class="stat-label">Avg CPU</div>
           <div class="stat-value" id="statCpu">—</div>
+        </div>
+      </div>
+      <!-- Whitelist (collapsed) -->
+      <div class="hud-panel" id="whitelistWrap">
+        <div class="hud-panel-header collapsible-header" data-toggle="whitelistBody">
+          <span>Whitelist</span>
+          <span class="collapse-arrow" id="whitelistArrow">▸</span>
+        </div>
+        <div id="whitelistBody" class="collapsible-body hidden">
+          <label class="whitelist-toggle">
+            <input type="checkbox" id="whitelistEnabled" />
+            <span>Whitelist enabled</span>
+          </label>
+          <ul id="whitelistPlayers" class="hud-list"></ul>
+          <div class="hud-input-row">
+            <input type="text" id="whitelistAddInput" class="hud-text-input" placeholder="Player name" maxlength="16" />
+            <button class="btn btn-secondary" id="whitelistAddBtn" type="button">Add</button>
+          </div>
+          <p id="whitelistStatus" class="status-text hidden"></p>
+        </div>
+      </div>
+      <!-- Server Logs (collapsed) -->
+      <div class="hud-panel" id="serverLogsWrap">
+        <div class="hud-panel-header collapsible-header" data-toggle="serverLogsBody">
+          <span>Server Logs</span>
+          <span class="collapse-arrow" id="serverLogsArrow">▸</span>
+        </div>
+        <div id="serverLogsBody" class="collapsible-body hidden">
+          <div class="hud-input-row">
+            <button class="btn btn-secondary btn-sm" id="refreshLogsBtn" type="button">Refresh</button>
+            <span id="serverLogsPath" class="setting-hint"></span>
+          </div>
+          <pre id="serverLogsOutput" class="server-logs-output">No logs yet — start the server to generate logs.</pre>
         </div>
       </div>
       <!-- RCON Console (collapsed) -->
@@ -144,6 +177,15 @@
                 <span class="setting-hint" style="white-space:nowrap">:25565</span>
                 <button class="btn btn-secondary" id="autoDetectBtn">Auto-detect</button>
               </div>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-label">
+              <span>MOTD</span>
+              <span class="setting-hint">Message shown in the server list. Restart the server to apply.</span>
+            </div>
+            <div class="setting-control">
+              <input type="text" id="motdInput" class="hud-text-input" placeholder="A Minecraft Server" maxlength="59" />
             </div>
           </div>
           <div class="setting-row">
