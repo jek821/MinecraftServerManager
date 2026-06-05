@@ -38,6 +38,8 @@ PACK_PORT = 17892     # dedicated resource-pack HTTP server
 DEFAULT_PUBLIC_PORT = 25565
 DEFAULT_MC_INTERNAL_PORT = 25566
 _IMAGE_EXTS = ('.png', '.jpg', '.jpeg')
+SERVER_ICON_FILE = BASE_DIR / 'server-icon.png'
+ICON_SIZE = 64
 
 def _load_secret_key() -> str:
     if key := os.environ.get('SECRET_KEY'):
@@ -671,6 +673,38 @@ def rebuild_paintings_all() -> int:
     return count
 
 
+# ─── Server icon ─────────────────────────────────────────────────────────────
+
+def _save_server_icon_file(upload) -> None:
+    """Resize upload to 64×64 PNG and save as the global server icon."""
+    with PILImage.open(upload) as img:
+        img = img.convert('RGBA')
+        img = img.resize((ICON_SIZE, ICON_SIZE), PILImage.Resampling.LANCZOS)
+        img.save(SERVER_ICON_FILE, 'PNG')
+
+
+def _apply_server_icon(world_dir: Path) -> None:
+    if SERVER_ICON_FILE.is_file():
+        shutil.copy2(SERVER_ICON_FILE, world_dir / 'server-icon.png')
+
+
+def _apply_server_icon_all() -> None:
+    if not SERVER_ICON_FILE.is_file() or not WORLDS_DIR.exists():
+        return
+    for world_dir in WORLDS_DIR.iterdir():
+        if world_dir.is_dir():
+            _apply_server_icon(world_dir)
+
+
+def _remove_server_icon_all() -> None:
+    if not WORLDS_DIR.exists():
+        return
+    for world_dir in WORLDS_DIR.iterdir():
+        icon = world_dir / 'server-icon.png'
+        if icon.is_file():
+            icon.unlink()
+
+
 # ─── Auth ────────────────────────────────────────────────────────────────────
 
 @app.route('/')
@@ -725,6 +759,7 @@ def activate_world(name):
     config = load_config()
     config['active_world'] = name
     save_config(config)
+    _apply_server_icon(world_dir)
     return jsonify({'ok': True})
 
 
@@ -1257,6 +1292,42 @@ def resource_pack_info(name):
     })
 
 
+# ─── Server icon API ─────────────────────────────────────────────────────────
+
+@app.route('/api/server-icon', methods=['GET'])
+@require_auth
+def get_server_icon():
+    if not SERVER_ICON_FILE.is_file():
+        return jsonify({'error': 'No server icon set'}), 404
+    return send_file(SERVER_ICON_FILE, mimetype='image/png')
+
+
+@app.route('/api/server-icon', methods=['POST'])
+@require_auth
+def upload_server_icon():
+    file = request.files.get('icon')
+    if not file or not file.filename:
+        return jsonify({'error': 'No file provided'}), 400
+    ext = Path(file.filename).suffix.lower()
+    if ext not in _IMAGE_EXTS:
+        return jsonify({'error': 'Only PNG/JPEG images allowed'}), 400
+    try:
+        _save_server_icon_file(file.stream)
+        _apply_server_icon_all()
+        return jsonify({'ok': True})
+    except Exception as e:
+        return jsonify({'error': f'Invalid image: {e}'}), 400
+
+
+@app.route('/api/server-icon', methods=['DELETE'])
+@require_auth
+def delete_server_icon():
+    if SERVER_ICON_FILE.is_file():
+        SERVER_ICON_FILE.unlink()
+    _remove_server_icon_all()
+    return jsonify({'ok': True})
+
+
 # ─── Config ───────────────────────────────────────────────────────────────────
 
 @app.route('/api/config', methods=['GET'])
@@ -1267,6 +1338,7 @@ def get_config_endpoint():
         'server_host': config.get('server_host', ''),
         'public_port': _public_port(),
         'jvm_args': config.get('jvm_args', _AIKAR_FLAGS),
+        'has_server_icon': SERVER_ICON_FILE.is_file(),
     })
 
 
@@ -1415,6 +1487,7 @@ def start_server():
         return jsonify({'error': 'server.jar not found in jars/ directory'}), 400
 
     (world_dir / 'eula.txt').write_text('eula=true\n')
+    _apply_server_icon(world_dir)
     if (world_dir / 'server.properties').exists():
         _ensure_mc_internal_port(world_dir)
         _ensure_rcon(world_dir)

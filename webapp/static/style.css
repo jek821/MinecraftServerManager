@@ -458,6 +458,26 @@ main {
 
 .setting-control { flex: 1; }
 
+.icon-upload-row {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+.server-icon-preview {
+  width: 64px;
+  height: 64px;
+  border-radius: 4px;
+  border: 1px solid var(--border, #334155);
+  image-rendering: pixelated;
+}
+
+.icon-upload-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
 .jvm-args-input {
   width: 100%;
   font-family: var(--font-mono, monospace);

@@ -617,11 +617,26 @@ document.getElementById('givePaintingBtn').addEventListener('click', async () =>
 });
 
 // ── Settings ──────────────────────────────────────────────────────────────────
+function refreshServerIconPreview(hasIcon) {
+  const preview = document.getElementById('serverIconPreview');
+  const removeBtn = document.getElementById('removeServerIconBtn');
+  if (hasIcon) {
+    preview.src = `/api/server-icon?t=${Date.now()}`;
+    preview.classList.remove('hidden');
+    removeBtn.classList.remove('hidden');
+  } else {
+    preview.classList.add('hidden');
+    preview.removeAttribute('src');
+    removeBtn.classList.add('hidden');
+  }
+}
+
 async function loadSettings() {
   try {
     const cfg = await apiJson('GET', '/api/config');
     _serverHost = cfg.server_host || '';
     document.getElementById('jvmArgs').value = cfg.jvm_args || '';
+    refreshServerIconPreview(!!cfg.has_server_icon);
     if (_serverHost) {
       document.getElementById('serverHost').value = _serverHost;
     } else {
@@ -633,6 +648,45 @@ async function loadSettings() {
     }
   } catch { /* non-fatal */ }
 }
+
+document.getElementById('serverIconInput').addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  e.target.value = '';
+  if (!file) return;
+  const statusEl = document.getElementById('serverIconStatus');
+  const form = new FormData();
+  form.append('icon', file);
+  try {
+    const res = await fetch('/api/server-icon', { method: 'POST', body: form });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Upload failed');
+    refreshServerIconPreview(true);
+    statusEl.textContent = '✔ Icon saved — restart server to show in server list';
+    statusEl.className = 'status-text ok';
+    statusEl.classList.remove('hidden');
+    setTimeout(() => statusEl.classList.add('hidden'), 3000);
+  } catch (err) {
+    statusEl.textContent = '✘ ' + err.message;
+    statusEl.className = 'status-text err';
+    statusEl.classList.remove('hidden');
+  }
+});
+
+document.getElementById('removeServerIconBtn').addEventListener('click', async () => {
+  const statusEl = document.getElementById('serverIconStatus');
+  try {
+    await apiJson('DELETE', '/api/server-icon');
+    refreshServerIconPreview(false);
+    statusEl.textContent = '✔ Icon removed — restart server to update server list';
+    statusEl.className = 'status-text ok';
+    statusEl.classList.remove('hidden');
+    setTimeout(() => statusEl.classList.add('hidden'), 3000);
+  } catch (err) {
+    statusEl.textContent = '✘ ' + err.message;
+    statusEl.className = 'status-text err';
+    statusEl.classList.remove('hidden');
+  }
+});
 
 document.getElementById('autoDetectBtn').addEventListener('click', async () => {
   try {

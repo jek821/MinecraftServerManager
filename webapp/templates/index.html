@@ -148,6 +148,23 @@
           </div>
           <div class="setting-row">
             <div class="setting-label">
+              <span>Server Icon</span>
+              <span class="setting-hint">64×64 image shown in the multiplayer server list. Shared across all worlds.</span>
+            </div>
+            <div class="setting-control">
+              <div class="icon-upload-row">
+                <img id="serverIconPreview" class="server-icon-preview hidden" alt="Server icon preview" width="64" height="64" />
+                <div class="icon-upload-actions">
+                  <label class="btn btn-secondary" for="serverIconInput">Upload Icon…</label>
+                  <input type="file" id="serverIconInput" accept="image/png,image/jpeg" style="display:none">
+                  <button class="btn btn-danger hidden" id="removeServerIconBtn" type="button">Remove</button>
+                </div>
+              </div>
+              <p id="serverIconStatus" class="status-text hidden"></p>
+            </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-label">
               <span>JVM Arguments</span>
               <span class="setting-hint">Passed to Java before <code>-jar</code>. Aikar's GC flags are the default — raise <code>-Xmx</code> to give Minecraft more heap (e.g. <code>-Xms4G -Xmx4G</code>).</span>
             </div>
