@@ -1167,7 +1167,11 @@ def generate_status(job_id):
 
 # ─── Chunk pre-generation (Paper + Chunky) ───────────────────────────────────
 
-CHUNKY_JAR_URL = 'https://github.com/pop4959/Chunky/releases/download/3.6.6/Chunky-3.6.6.jar'
+# Chunky has no GitHub releases; official Bukkit/Paper builds are on CodeMC CI.
+CHUNKY_JAR_URL = (
+    'https://ci.codemc.io/job/pop4959/job/Chunky/lastSuccessfulBuild/'
+    'artifact/bukkit/build/libs/Chunky-Bukkit-1.5.3.jar'
+)
 
 
 def _ensure_chunky_plugin(world_dir: Path) -> Path:
