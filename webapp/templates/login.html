@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MC Server Manager</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="login-body">
+  <div class="login-card">
+    <div class="login-icon">⛏</div>
+    <h1>MC Server Manager</h1>
+    <form id="loginForm">
+      <input type="password" id="password" placeholder="Password" autocomplete="current-password" autofocus>
+      <button type="submit">Sign In</button>
+      <p id="loginError" class="error-text hidden"></p>
+    </form>
+  </div>
+  <script>
+    document.getElementById('loginForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const pw = document.getElementById('password').value;
+      const err = document.getElementById('loginError');
+      const res = await fetch('/login', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({password: pw}),
+      });
+      if (res.ok) {
+        location.reload();
+      } else {
+        err.textContent = 'Invalid password';
+        err.classList.remove('hidden');
+      }
+    });
+  </script>
+</body>
+</html>

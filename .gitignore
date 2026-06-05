@@ -1,0 +1,15 @@
+# World data (large binary files)
+worldFiles/
+
+# Server jars
+jars/
+
+# Runtime config (contains local IP)
+config.json
+
+# Python
+webapp/__pycache__/
+webapp/*.pyc
+**/__pycache__/
+*.pyc
+*.pyo

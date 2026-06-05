@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MC Server Manager</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+  <!-- Header -->
+  <header>
+    <div class="header-inner">
+      <span class="header-title">⛏ MC Server Manager</span>
+      <button class="btn btn-ghost" id="logoutBtn">Logout</button>
+    </div>
+  </header>
+
+  <!-- Main -->
+  <main>
+
+    <!-- Worlds Section -->
+    <section class="section">
+      <div class="section-header">
+        <h2>World Saves</h2>
+        <button class="btn btn-primary" id="newWorldBtn">+ New World</button>
+      </div>
+      <div id="worldsGrid" class="worlds-grid">
+        <div class="loading">Loading worlds…</div>
+      </div>
+    </section>
+
+    <!-- Jars Section -->
+    <section class="section">
+      <div class="section-header">
+        <h2>Server Jar</h2>
+      </div>
+      <div id="jarsContent">
+        <div class="loading">Loading…</div>
+      </div>
+      <div class="jar-update-form">
+        <h3>Update Jar from URL</h3>
+        <div class="jar-guide">
+          <span class="jar-guide-icon">💡</span>
+          <span>
+            To get a download link, visit
+            <a href="https://jars.vexyhost.com/" target="_blank" rel="noopener">jars.vexyhost.com</a>,
+            find the version you want, then <strong>right-click the blue Download button</strong>
+            and choose <em>Copy link address</em>. Paste it below.
+          </span>
+        </div>
+        <div class="input-row">
+          <input type="url" id="jarUrl" placeholder="https://..." />
+          <button class="btn btn-primary" id="updateJarBtn">Download &amp; Replace</button>
+        </div>
+        <p id="jarUpdateStatus" class="status-text hidden"></p>
+      </div>
+    </section>
+
+    <!-- Settings Section -->
+    <section class="section">
+      <div class="section-header">
+        <h2>Settings</h2>
+      </div>
+      <div class="settings-grid">
+        <div class="setting-row">
+          <div class="setting-label">
+            <span>Server Host</span>
+            <span class="setting-hint">LAN IP of this machine — used to build the resource-pack URL pushed to players</span>
+          </div>
+          <div class="setting-control">
+            <div class="input-row">
+              <input type="text" id="serverHost" placeholder="e.g. 192.168.1.100" />
+              <input type="number" id="serverPort" placeholder="5000" min="1" max="65535" style="width:90px" />
+              <button class="btn btn-secondary" id="autoDetectBtn">Auto-detect</button>
+              <button class="btn btn-primary" id="saveSettingsBtn">Save</button>
+            </div>
+            <p id="settingsStatus" class="status-text hidden"></p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- ── Modals ─────────────────────────────────────────────────── -->
+
+  <!-- Properties Modal -->
+  <div id="propsModal" class="modal-overlay hidden">
+    <div class="modal">
+      <div class="modal-header">
+        <h3 id="propsModalTitle">server.properties</h3>
+        <button class="modal-close" data-close="propsModal">✕</button>
+      </div>
+      <textarea id="propsEditor" class="code-editor" spellcheck="false"></textarea>
+      <div class="modal-footer">
+        <button class="btn btn-ghost" data-close="propsModal">Cancel</button>
+        <button class="btn btn-primary" id="savePropsBtn">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Images Modal -->
+  <div id="imagesModal" class="modal-overlay hidden">
+    <div class="modal">
+      <div class="modal-header">
+        <h3 id="imagesModalTitle">Painting Images</h3>
+        <button class="modal-close" data-close="imagesModal">✕</button>
+      </div>
+      <div id="imagesHostWarning" class="images-host-warning hidden">
+        ⚠ Server Host isn't set — resource-pack URL won't be written to server.properties.
+        <a href="#" id="imagesHostLink">Set it in Settings.</a>
+      </div>
+      <div class="images-hint">
+        Images should be multiples of 16 px per block (e.g. 32×32 = 2×2 blocks).
+        After uploading, restart the server for the resource pack to take effect.
+      </div>
+      <div id="imagesList" class="images-list"></div>
+      <div class="image-upload-area">
+        <label class="btn btn-secondary" for="imageFileInput">Choose Images…</label>
+        <input type="file" id="imageFileInput" accept="image/png,image/jpeg" multiple style="display:none">
+        <span id="imageUploadStatus" class="status-text"></span>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-ghost" data-close="imagesModal">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- New World Modal -->
+  <div id="generateModal" class="modal-overlay hidden">
+    <div class="modal modal-wide">
+      <div class="modal-header">
+        <h3>Generate New World</h3>
+        <button class="modal-close" data-close="generateModal">✕</button>
+      </div>
+      <div class="generate-form">
+        <label>New world name
+          <input type="text" id="newWorldName" placeholder="e.g. SurvivalWorld2" />
+        </label>
+        <label class="checkbox-label">
+          <input type="checkbox" id="inheritProps" checked />
+          Copy server.properties from current active world
+        </label>
+      </div>
+      <div id="generateLog" class="generate-log hidden"></div>
+      <div class="modal-footer">
+        <button class="btn btn-ghost" id="cancelGenerateBtn" data-close="generateModal">Cancel</button>
+        <button class="btn btn-primary" id="startGenerateBtn">Generate</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Give Painting Modal -->
+  <div id="giveModal" class="modal-overlay hidden">
+    <div class="modal modal-wide">
+      <div class="modal-header">
+        <h3 id="giveModalTitle">Give Painting</h3>
+        <button class="modal-close" data-close="giveModal">✕</button>
+      </div>
+      <div class="give-body">
+        <div class="give-col">
+          <div class="give-col-header">
+            <span>Online Players</span>
+            <button class="btn btn-ghost btn-sm" id="refreshPlayersBtn">Refresh</button>
+          </div>
+          <div id="playersList" class="give-list"></div>
+        </div>
+        <div class="give-col">
+          <div class="give-col-header">
+            <span>Paintings</span>
+          </div>
+          <div id="paintingsList" class="give-list"></div>
+        </div>
+      </div>
+      <div id="giveStatus" class="give-status hidden"></div>
+      <div class="modal-footer">
+        <button class="btn btn-ghost" data-close="giveModal">Close</button>
+        <button class="btn btn-primary" id="givePaintingBtn" disabled>Give</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Delete Confirm Modal -->
+  <div id="deleteModal" class="modal-overlay hidden">
+    <div class="modal modal-sm">
+      <div class="modal-header">
+        <h3>Delete World</h3>
+        <button class="modal-close" data-close="deleteModal">✕</button>
+      </div>
+      <p id="deleteModalText" class="modal-body-text"></p>
+      <div class="modal-footer">
+        <button class="btn btn-ghost" data-close="deleteModal">Cancel</button>
+        <button class="btn btn-danger" id="confirmDeleteBtn">Delete</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
