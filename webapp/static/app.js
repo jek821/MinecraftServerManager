@@ -229,6 +229,17 @@ async function openImages(name) {
   warn.classList.toggle('hidden', !!_serverHost);
   openModal('imagesModal');
   await refreshImages();
+  // Rebuild data pack for this world in the background so images take effect
+  rebuildPaintingsForWorld(name);
+}
+
+async function rebuildPaintingsForWorld(name) {
+  const btn = document.getElementById('applyPaintingsBtn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Applying…'; }
+  try {
+    await apiJson('POST', `/api/worlds/${encodeURIComponent(name)}/rebuild-paintings`);
+  } catch (_) { /* silent — non-critical */ }
+  if (btn) { btn.disabled = false; btn.textContent = 'Apply to World'; }
 }
 
 document.getElementById('imagesHostLink').addEventListener('click', (e) => {
@@ -271,6 +282,10 @@ document.getElementById('imagesList').addEventListener('click', async (e) => {
   } catch (err) {
     alert('Delete failed: ' + err.message);
   }
+});
+
+document.getElementById('applyPaintingsBtn').addEventListener('click', () => {
+  if (_imagesWorld) rebuildPaintingsForWorld(_imagesWorld);
 });
 
 document.getElementById('imageFileInput').addEventListener('change', async (e) => {

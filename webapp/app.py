@@ -656,6 +656,19 @@ def delete_image(name, filename):
     return jsonify({'ok': True})
 
 
+@app.route('/api/worlds/<name>/rebuild-paintings', methods=['POST'])
+@require_auth
+def rebuild_paintings_endpoint(name):
+    world_dir = safe_child(WORLDS_DIR, name)
+    if not world_dir.is_dir():
+        return jsonify({'error': 'World not found'}), 404
+    try:
+        rebuild_paintings(world_dir)
+        return jsonify({'ok': True})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/worlds/<name>', methods=['DELETE'])
 @require_auth
 def delete_world(name):
