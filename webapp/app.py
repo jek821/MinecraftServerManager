@@ -3,6 +3,7 @@ import io
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import struct
@@ -73,10 +74,21 @@ _props_write_lock = threading.Lock()
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 
+_AIKAR_FLAGS = (
+    '-Xms12G -Xmx12G -XX:+UseG1GC -XX:+ParallelRefProcEnabled -XX:MaxGCPauseMillis=200'
+    ' -XX:+UnlockExperimentalVMOptions -XX:+DisableExplicitGC -XX:+AlwaysPreTouch'
+    ' -XX:G1NewSizePercent=30 -XX:G1MaxNewSizePercent=40 -XX:G1HeapRegionSize=8M'
+    ' -XX:G1ReservePercent=20 -XX:G1HeapWastePercent=5 -XX:G1MixedGCCountTarget=4'
+    ' -XX:InitiatingHeapOccupancyPercent=15 -XX:G1MixedGCLiveThresholdPercent=90'
+    ' -XX:G1RSetUpdatingPauseTimePercent=5 -XX:SurvivorRatio=32'
+    ' -XX:+PerfDisableSharedMem -XX:MaxTenuringThreshold=1'
+)
+
+
 def load_config() -> dict:
     if CONFIG_FILE.exists():
         return json.loads(CONFIG_FILE.read_text())
-    return {'active_world': None, 'java_cmd': 'java'}
+    return {'active_world': None, 'java_cmd': 'java', 'jvm_args': _AIKAR_FLAGS}
 
 
 def save_config(config: dict) -> None:
@@ -754,6 +766,7 @@ def _run_generate(job_id: str, new_name: str, inherit_properties: bool, old_acti
     jar = JARS_DIR / 'server.jar'
     config = load_config()
     java_cmd = config.get('java_cmd', 'java')
+    jvm_args = shlex.split(config.get('jvm_args', _AIKAR_FLAGS))
 
     def log(msg: str):
         with _jobs_lock:
@@ -787,9 +800,9 @@ def _run_generate(job_id: str, new_name: str, inherit_properties: bool, old_acti
         if not jar.exists():
             raise RuntimeError('server.jar not found in jars/ directory')
 
-        log(f'Starting server: {java_cmd} -jar {jar.name} --nogui')
+        log(f'Starting server: {java_cmd} {" ".join(jvm_args)} -jar {jar.name} --nogui')
         proc = subprocess.Popen(
-            [java_cmd, '-jar', str(jar), '--nogui'],
+            [java_cmd, *jvm_args, '-jar', str(jar), '--nogui'],
             cwd=str(new_dir),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -1063,6 +1076,7 @@ def get_config_endpoint():
     return jsonify({
         'server_host': config.get('server_host', ''),
         'port': config.get('port', 5000),
+        'jvm_args': config.get('jvm_args', _AIKAR_FLAGS),
     })
 
 
@@ -1078,6 +1092,8 @@ def save_config_endpoint():
             config['port'] = int(data['port'])
         except (ValueError, TypeError):
             return jsonify({'error': 'Invalid port'}), 400
+    if 'jvm_args' in data:
+        config['jvm_args'] = str(data['jvm_args']).strip()
     save_config(config)
     return jsonify({'ok': True})
 
@@ -1217,10 +1233,11 @@ def start_server():
     if (world_dir / 'server.properties').exists():
         _ensure_rcon(world_dir)
     java_cmd = config.get('java_cmd', 'java')
+    jvm_args = shlex.split(config.get('jvm_args', _AIKAR_FLAGS))
 
     try:
         proc = subprocess.Popen(
-            [java_cmd, '-jar', str(jar), '--nogui'],
+            [java_cmd, *jvm_args, '-jar', str(jar), '--nogui'],
             cwd=str(world_dir),
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,

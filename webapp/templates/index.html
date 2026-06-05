@@ -143,10 +143,21 @@
                 <input type="text" id="serverHost" placeholder="e.g. 192.168.1.100" />
                 <input type="number" id="serverPort" placeholder="5000" min="1" max="65535" style="width:90px" />
                 <button class="btn btn-secondary" id="autoDetectBtn">Auto-detect</button>
-                <button class="btn btn-primary" id="saveSettingsBtn">Save</button>
               </div>
-              <p id="settingsStatus" class="status-text hidden"></p>
             </div>
+          </div>
+          <div class="setting-row">
+            <div class="setting-label">
+              <span>JVM Arguments</span>
+              <span class="setting-hint">Passed to Java before <code>-jar</code>. Aikar's GC flags are the default — raise <code>-Xmx</code> to give Minecraft more heap (e.g. <code>-Xms4G -Xmx4G</code>).</span>
+            </div>
+            <div class="setting-control">
+              <textarea id="jvmArgs" class="jvm-args-input" rows="4" spellcheck="false"></textarea>
+            </div>
+          </div>
+          <div class="setting-row setting-row-actions">
+            <button class="btn btn-primary" id="saveSettingsBtn">Save</button>
+            <p id="settingsStatus" class="status-text hidden"></p>
           </div>
         </div>
       </div>

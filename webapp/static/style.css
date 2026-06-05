@@ -458,6 +458,27 @@ main {
 
 .setting-control { flex: 1; }
 
+.jvm-args-input {
+  width: 100%;
+  font-family: var(--font-mono, monospace);
+  font-size: 0.78rem;
+  background: var(--bg-input, #1a1a2e);
+  color: var(--text-primary, #e2e8f0);
+  border: 1px solid var(--border, #334155);
+  border-radius: 6px;
+  padding: 0.5rem 0.65rem;
+  resize: vertical;
+  box-sizing: border-box;
+}
+.jvm-args-input:focus { outline: none; border-color: var(--accent, #6366f1); }
+
+.setting-row-actions {
+  align-items: center;
+  border-top: 1px solid var(--border, #334155);
+  padding-top: 0.75rem;
+  gap: 1rem;
+}
+
 /* ── Images modal extras ──────────────────────────────────────────────────── */
 .images-host-warning {
   background: #3b1f00;

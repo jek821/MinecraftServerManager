@@ -595,6 +595,7 @@ async function loadSettings() {
     const cfg = await apiJson('GET', '/api/config');
     _serverHost = cfg.server_host || '';
     document.getElementById('serverPort').value = cfg.port || 5000;
+    document.getElementById('jvmArgs').value = cfg.jvm_args || '';
     if (_serverHost) {
       document.getElementById('serverHost').value = _serverHost;
     } else {
@@ -617,9 +618,10 @@ document.getElementById('autoDetectBtn').addEventListener('click', async () => {
 document.getElementById('saveSettingsBtn').addEventListener('click', async () => {
   const host = document.getElementById('serverHost').value.trim();
   const port = document.getElementById('serverPort').value.trim() || '5000';
+  const jvmArgs = document.getElementById('jvmArgs').value.trim();
   const statusEl = document.getElementById('settingsStatus');
   try {
-    await apiJson('POST', '/api/config', { server_host: host, port: parseInt(port, 10) });
+    await apiJson('POST', '/api/config', { server_host: host, port: parseInt(port, 10), jvm_args: jvmArgs });
     _serverHost = host;
     statusEl.textContent = '✔ Saved';
     statusEl.className = 'status-text ok';
