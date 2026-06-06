@@ -289,7 +289,7 @@ async function downloadWorld(btn, name) {
         intervalMs: 1500,
         onLog(lines) {
           const last = lines[lines.length - 1];
-          if (last) btn.textContent = last.length > 28 ? 'Zipping…' : last;
+          if (last && last.startsWith('Zipping')) btn.textContent = last;
         },
         onDone(job) {
           _stopDownloadPoll = null;
