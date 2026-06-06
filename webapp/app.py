@@ -19,10 +19,7 @@ from functools import wraps
 from pathlib import Path
 
 import requests
-from flask import (
-    Flask, Response, after_this_request, jsonify,
-    render_template, request, send_file, session,
-)
+from flask import Flask, Response, jsonify, render_template, request, send_file, session
 from PIL import Image as PILImage
 
 from port_proxy import start_port_proxy
@@ -338,9 +335,25 @@ def _world_download_arcname(world_dir: Path, world_name: str, fp: Path) -> str |
         rel = fp.relative_to(world_dir)
     except ValueError:
         return None
+    if fp.name == 'session.lock':
+        return None
     if rel.parts and rel.parts[0] in _DOWNLOAD_SKIP_DIRS:
         return None
     return f'{world_name}/{rel.as_posix()}'
+
+
+def _build_world_zip(world_dir: Path, world_name: str, dest: Path) -> int:
+    """Zip world save data; returns number of files included."""
+    count = 0
+    with zipfile.ZipFile(dest, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for fp in world_dir.rglob('*'):
+            if not fp.is_file():
+                continue
+            arcname = _world_download_arcname(world_dir, world_name, fp)
+            if arcname:
+                zf.write(fp, arcname)
+                count += 1
+    return count
 
 
 def valid_world_name(name: str) -> bool:
@@ -1027,41 +1040,106 @@ def activate_world(name):
     return jsonify({'ok': True})
 
 
-@app.route('/api/worlds/<name>/download')
+def _run_download_zip(job_id: str, world_name: str):
+    world_dir = safe_child(WORLDS_DIR, world_name)
+    tmp_path: Path | None = None
+
+    def log(msg: str):
+        with _jobs_lock:
+            _jobs[job_id]['log'].append(msg)
+
+    def set_status(status: str, error: str | None = None):
+        with _jobs_lock:
+            if _jobs.get(job_id, {}).get('status') != 'running':
+                return
+            _jobs[job_id]['status'] = status
+            if error:
+                _jobs[job_id]['error'] = error
+            _jobs[job_id]['finished_at'] = time.time()
+        _prune_finished_jobs()
+
+    try:
+        log('Creating zip (large worlds may take several minutes)…')
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
+        tmp_path = Path(tmp.name)
+        tmp.close()
+        count = _build_world_zip(world_dir, world_name, tmp_path)
+        size_mb = tmp_path.stat().st_size / (1024 * 1024)
+        log(f'Zip ready — {count} files, {size_mb:.1f} MB.')
+        with _jobs_lock:
+            _jobs[job_id]['zip_path'] = str(tmp_path)
+            _jobs[job_id]['world'] = world_name
+        set_status('done')
+    except Exception as e:
+        if tmp_path:
+            tmp_path.unlink(missing_ok=True)
+        set_status('error', str(e))
+
+
+def _cleanup_download_zip(job_id: str) -> None:
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            return
+        zip_path = job.pop('zip_path', None)
+    if zip_path:
+        Path(zip_path).unlink(missing_ok=True)
+
+
+@app.route('/api/worlds/<name>/download', methods=['POST'])
 @require_auth
-def download_world(name):
+def start_download_world(name):
     world_dir = safe_child(WORLDS_DIR, name)
     if not world_dir.is_dir():
         return jsonify({'error': 'World not found'}), 404
     if _world_has_running_job(name):
-        return jsonify({'error': 'A background job is running for this world'}), 400
+        return jsonify({'error': 'A background job is already running for this world'}), 400
+    if _managed_server_running():
+        config = load_config()
+        if config.get('active_world') == name:
+            return jsonify({'error': 'Stop the server before downloading this world'}), 400
 
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
-    tmp_path = Path(tmp.name)
-    tmp.close()
-    try:
-        with zipfile.ZipFile(tmp_path, 'w', zipfile.ZIP_DEFLATED) as zf:
-            for fp in world_dir.rglob('*'):
-                if not fp.is_file():
-                    continue
-                arcname = _world_download_arcname(world_dir, name, fp)
-                if arcname:
-                    zf.write(fp, arcname)
-    except Exception:
-        tmp_path.unlink(missing_ok=True)
-        raise
+    job_id = _try_reserve_job(name, 'download')
+    if not job_id:
+        return jsonify({'error': 'A background job is already running for this world'}), 400
 
-    @after_this_request
-    def _remove_temp_zip(response):
-        tmp_path.unlink(missing_ok=True)
-        return response
+    t = threading.Thread(target=_run_download_zip, args=(job_id, name), daemon=True)
+    t.start()
+    return jsonify({'job_id': job_id})
 
-    return send_file(
-        tmp_path,
+
+@app.route('/api/worlds/download/<job_id>')
+@require_auth
+def download_world_status(job_id):
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if not job or job.get('type') != 'download':
+        return jsonify({'error': 'Job not found'}), 404
+    return jsonify(job)
+
+
+@app.route('/api/worlds/download/<job_id>/file')
+@require_auth
+def download_world_file(job_id):
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if not job or job.get('type') != 'download':
+        return jsonify({'error': 'Job not found'}), 404
+    if job.get('status') != 'done':
+        return jsonify({'error': 'Zip is not ready yet'}), 400
+    zip_path = job.get('zip_path')
+    world_name = job.get('world', 'world')
+    if not zip_path or not Path(zip_path).is_file():
+        return jsonify({'error': 'Zip file missing — try downloading again'}), 404
+
+    resp = send_file(
+        zip_path,
         mimetype='application/zip',
         as_attachment=True,
-        download_name=f'{name}.zip',
+        download_name=f'{world_name}.zip',
     )
+    resp.call_on_close(lambda: _cleanup_download_zip(job_id))
+    return resp
 
 
 @app.route('/api/worlds/<name>/properties', methods=['GET'])

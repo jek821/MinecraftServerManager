@@ -271,28 +271,38 @@ async function activateWorld(name) {
   });
 }
 
+let _stopDownloadPoll = null;
+
 async function downloadWorld(btn, name) {
   if (_locks.has('download')) return;
   _locks.add('download');
   const orig = btn.textContent;
   btn.disabled = true;
   btn.textContent = 'Zipping…';
+  if (_stopDownloadPoll) _stopDownloadPoll();
+
   try {
-    const res = await fetch(`/api/worlds/${encodeURIComponent(name)}/download`);
-    if (!res.ok) {
-      const data = await res.json().catch(() => ({}));
-      throw new Error(data.error || `HTTP ${res.status}`);
-    }
-    btn.textContent = 'Downloading…';
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${name}.zip`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
+    const { job_id } = await apiJson('POST', `/api/worlds/${encodeURIComponent(name)}/download`);
+
+    await new Promise((resolve, reject) => {
+      _stopDownloadPoll = startJobPoll(`/api/worlds/download/${job_id}`, {
+        intervalMs: 1500,
+        onLog(lines) {
+          const last = lines[lines.length - 1];
+          if (last) btn.textContent = last.length > 28 ? 'Zipping…' : last;
+        },
+        onDone(job) {
+          _stopDownloadPoll = null;
+          if (job.status === 'done') {
+            btn.textContent = 'Downloading…';
+            window.location.href = `/api/worlds/download/${job_id}/file`;
+            resolve();
+          } else {
+            reject(new Error(job.error || 'Zip failed'));
+          }
+        },
+      });
+    });
   } catch (err) {
     alert('Download failed: ' + err.message);
   } finally {
