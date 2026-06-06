@@ -44,6 +44,18 @@ def _read_http_request(sock: socket.socket) -> bytes:
     return buf
 
 
+def _inject_forwarded_for(buf: bytes, client_ip: str) -> bytes:
+    if not client_ip:
+        return buf
+    head, sep, rest = buf.partition(b'\r\n')
+    if not sep:
+        return buf
+    headers_block = rest.split(b'\r\n\r\n', 1)[0]
+    if b'x-forwarded-for:' in headers_block.lower():
+        return buf
+    return head + b'\r\n' + f'X-Forwarded-For: {client_ip}\r\n'.encode() + rest
+
+
 def _parse_http(buf: bytes) -> tuple[str, str]:
     line = buf.split(b'\r\n', 1)[0].decode('utf-8', errors='replace')
     parts = line.split()
@@ -93,6 +105,7 @@ def _http_backend_port(path: str, pack_port: int, flask_port: int) -> int:
 
 def _handle_client(
     client: socket.socket,
+    client_addr: tuple[str, int],
     mc_host: str,
     mc_port: int,
     flask_host: str,
@@ -109,6 +122,7 @@ def _handle_client(
 
         if _is_http_peek(client) or isinstance(client, ssl.SSLSocket):
             buf = _read_http_request(client)
+            buf = _inject_forwarded_for(buf, client_addr[0])
             _method, path = _parse_http(buf)
             dest_port = _http_backend_port(path, pack_port, flask_port)
             backend = socket.create_connection((flask_host, dest_port), timeout=30)
@@ -140,10 +154,10 @@ def _listen_loop(
     listener.bind((public_host, public_port))
     listener.listen(256)
     while True:
-        client, _addr = listener.accept()
+        client, addr = listener.accept()
         threading.Thread(
             target=_handle_client,
-            args=(client, mc_host, mc_port, flask_host, flask_port, pack_port, ssl_context),
+            args=(client, addr, mc_host, mc_port, flask_host, flask_port, pack_port, ssl_context),
             daemon=True,
         ).start()
 

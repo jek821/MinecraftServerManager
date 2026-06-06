@@ -26,10 +26,11 @@
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({password: pw}),
       });
+      const data = await res.json().catch(() => ({}));
       if (res.ok) {
         location.reload();
       } else {
-        err.textContent = 'Invalid password';
+        err.textContent = data.error || 'Invalid password';
         err.classList.remove('hidden');
       }
     });

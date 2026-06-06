@@ -93,6 +93,11 @@ _rebuild_busy: set[str] = set()
 _rebuild_busy_lock = threading.Lock()
 _icon_lock = threading.Lock()
 
+_LOGIN_MAX_ATTEMPTS = 10
+_LOGIN_COOLDOWN_SEC = 10 * 60 * 60
+_login_lockouts: dict[str, dict] = {}
+_login_lockouts_lock = threading.Lock()
+
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -229,6 +234,14 @@ def _background_mc_jobs_running() -> bool:
             j.get('status') == 'running' and j.get('type') in ('pregen', 'generate')
             for j in _jobs.values()
         )
+
+
+def _active_background_mc_job() -> dict | None:
+    with _jobs_lock:
+        for job in _jobs.values():
+            if job.get('status') == 'running' and job.get('type') in ('pregen', 'generate'):
+                return {'type': job['type'], 'world': job.get('world')}
+    return None
 
 
 def _managed_server_running() -> bool:
@@ -882,6 +895,46 @@ def _remove_server_icon_all() -> None:
 
 # ─── Auth ────────────────────────────────────────────────────────────────────
 
+def _client_ip() -> str:
+    forwarded = request.headers.get('X-Forwarded-For', '')
+    if forwarded:
+        return forwarded.split(',')[0].strip()
+    return request.remote_addr or 'unknown'
+
+
+def _login_lockout_message(ip: str) -> str | None:
+    with _login_lockouts_lock:
+        entry = _login_lockouts.get(ip)
+        if not entry:
+            return None
+        locked_until = entry.get('locked_until')
+        if not locked_until:
+            return None
+        remaining = locked_until - time.time()
+        if remaining <= 0:
+            _login_lockouts.pop(ip, None)
+            return None
+        hours = int(remaining // 3600)
+        mins = int((remaining % 3600) // 60)
+        return f'Too many failed attempts. Try again in {hours}h {mins}m.'
+
+
+def _login_record_failure(ip: str) -> tuple[int, str | None]:
+    """Return (attempts_remaining, lockout_message_if_locked)."""
+    with _login_lockouts_lock:
+        entry = _login_lockouts.setdefault(ip, {'failures': 0, 'locked_until': None})
+        entry['failures'] += 1
+        if entry['failures'] >= _LOGIN_MAX_ATTEMPTS:
+            entry['locked_until'] = time.time() + _LOGIN_COOLDOWN_SEC
+            return 0, 'Too many failed attempts. Try again in 10 hours.'
+        return _LOGIN_MAX_ATTEMPTS - entry['failures'], None
+
+
+def _login_clear_failures(ip: str) -> None:
+    with _login_lockouts_lock:
+        _login_lockouts.pop(ip, None)
+
+
 @app.route('/')
 def index():
     if not session.get('authenticated'):
@@ -891,11 +944,23 @@ def index():
 
 @app.route('/login', methods=['POST'])
 def login():
+    ip = _client_ip()
+    lockout = _login_lockout_message(ip)
+    if lockout:
+        return jsonify({'error': lockout}), 429
+
     data = request.get_json() or {}
     if data.get('password') == PASSWORD:
+        _login_clear_failures(ip)
         session['authenticated'] = True
         return jsonify({'ok': True})
-    return jsonify({'error': 'Invalid password'}), 401
+
+    remaining, lockout = _login_record_failure(ip)
+    if lockout:
+        return jsonify({'error': lockout}), 429
+    return jsonify({
+        'error': f'Invalid password ({remaining} attempt{"s" if remaining != 1 else ""} remaining)',
+    }), 401
 
 
 @app.route('/logout', methods=['POST'])
@@ -2305,20 +2370,31 @@ def get_server_status():
     except Exception:
         pass
 
-    running = ping is not None
-    if managed_running and not running:
+    port_active = ping is not None
+    bg_job = _active_background_mc_job()
+
+    if managed_running and not port_active:
         state = 'starting'
-    elif running:
+    elif managed_running and port_active:
+        state = 'running'
+    elif bg_job and port_active:
+        state = 'pregen' if bg_job['type'] == 'pregen' else 'generating'
+    elif port_active:
         state = 'running'
     else:
         state = 'stopped'
+
+    display_world = active_world
+    if bg_job and bg_job.get('world'):
+        display_world = bg_job['world']
 
     metrics = _proc_metrics(proc.pid) if managed_running else None
     addr = _server_address()
 
     return jsonify({
         'state': state,
-        'world': active_world,
+        'world': display_world,
+        'background_job': bg_job,
         'uptime': uptime,
         'server_address': addr or None,
         'players_online': ping['players_online'] if ping else None,

@@ -1103,7 +1103,12 @@ function updateServerHud(data) {
   dot.className = 'server-status-dot ' + displayState;
 
   const stateLabel = {
-    running: 'RUNNING', starting: 'STARTING', stopping: 'STOPPING', stopped: 'STOPPED',
+    running: 'RUNNING',
+    pregen: 'PRE-GEN',
+    generating: 'GENERATING',
+    starting: 'STARTING',
+    stopping: 'STOPPING',
+    stopped: 'STOPPED',
   }[displayState] || displayState.toUpperCase();
   label.textContent = data.world ? `${stateLabel} — ${data.world}` : stateLabel;
 
@@ -1120,13 +1125,14 @@ function updateServerHud(data) {
   } else {
     startBtn.textContent = START_LABEL;
     stopBtn.textContent = STOP_LABEL;
+    const bgBusy = data.state === 'pregen' || data.state === 'generating';
     startBtn.disabled = data.state !== 'stopped';
-    stopBtn.disabled = data.state === 'stopped';
+    stopBtn.disabled = data.state === 'stopped' || bgBusy;
   }
 
-  const running = data.state === 'running' && !_serverPending;
-  giveHudBtn.disabled = !running;
-  document.getElementById('manageOpsHudBtn').disabled = !running;
+  const playable = data.state === 'running' && !_serverPending;
+  giveHudBtn.disabled = !playable;
+  document.getElementById('manageOpsHudBtn').disabled = !playable;
 
   document.getElementById('statPlayers').textContent =
     data.players_online != null ? `${data.players_online} / ${data.players_max}` : '—';
@@ -1151,7 +1157,7 @@ function updateServerHud(data) {
   }
 
   scheduleStatusPoll(_serverPending ? STATUS_POLL_FAST : STATUS_POLL_SLOW);
-  if (data.state === 'running' && !_serverPending && !document.getElementById('serverLogsBody').classList.contains('hidden')) {
+  if (playable && !document.getElementById('serverLogsBody').classList.contains('hidden')) {
     loadServerLogs();
   }
 }

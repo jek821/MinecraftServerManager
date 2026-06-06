@@ -614,6 +614,8 @@ main {
   background: var(--accent);
   box-shadow: 0 0 6px var(--accent);
 }
+.server-status-dot.pregen,
+.server-status-dot.generating,
 .server-status-dot.starting,
 .server-status-dot.stopping {
   background: #fbbf24;
