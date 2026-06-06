@@ -19,7 +19,10 @@ from functools import wraps
 from pathlib import Path
 
 import requests
-from flask import Flask, Response, jsonify, render_template, request, send_file, session
+from flask import (
+    Flask, Response, after_this_request, jsonify,
+    render_template, request, send_file, session,
+)
 from PIL import Image as PILImage
 
 from port_proxy import start_port_proxy
@@ -322,6 +325,22 @@ def get_level_name(world_dir: Path) -> str:
             if line.startswith('level-name='):
                 return line.split('=', 1)[1].strip()
     return 'world'
+
+
+# Paper extracts these into the world folder on start — not part of the save.
+_DOWNLOAD_SKIP_DIRS = frozenset({
+    'libraries', 'versions', 'logs', 'crash-reports', 'cache',
+})
+
+
+def _world_download_arcname(world_dir: Path, world_name: str, fp: Path) -> str | None:
+    try:
+        rel = fp.relative_to(world_dir)
+    except ValueError:
+        return None
+    if rel.parts and rel.parts[0] in _DOWNLOAD_SKIP_DIRS:
+        return None
+    return f'{world_name}/{rel.as_posix()}'
 
 
 def valid_world_name(name: str) -> bool:
@@ -1016,14 +1035,33 @@ def download_world(name):
         return jsonify({'error': 'World not found'}), 404
     if _world_has_running_job(name):
         return jsonify({'error': 'A background job is running for this world'}), 400
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
-        for fp in world_dir.rglob('*'):
-            if fp.is_file():
-                zf.write(fp, fp.relative_to(WORLDS_DIR))
-    buf.seek(0)
-    return send_file(buf, mimetype='application/zip', as_attachment=True,
-                     download_name=f'{name}.zip')
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
+    tmp_path = Path(tmp.name)
+    tmp.close()
+    try:
+        with zipfile.ZipFile(tmp_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for fp in world_dir.rglob('*'):
+                if not fp.is_file():
+                    continue
+                arcname = _world_download_arcname(world_dir, name, fp)
+                if arcname:
+                    zf.write(fp, arcname)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+    @after_this_request
+    def _remove_temp_zip(response):
+        tmp_path.unlink(missing_ok=True)
+        return response
+
+    return send_file(
+        tmp_path,
+        mimetype='application/zip',
+        as_attachment=True,
+        download_name=f'{name}.zip',
+    )
 
 
 @app.route('/api/worlds/<name>/properties', methods=['GET'])

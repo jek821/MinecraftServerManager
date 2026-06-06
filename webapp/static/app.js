@@ -200,7 +200,7 @@ document.getElementById('worldsGrid').addEventListener('click', async (e) => {
       btn.disabled = false;
     }
   }
-  if (action === 'download')    downloadWorld(name);
+  if (action === 'download')    await downloadWorld(btn, name);
   if (action === 'properties')  await openProperties(name);
   if (action === 'images')      await openImages(name);
   if (action === 'pregen')      openPregen(name);
@@ -271,8 +271,35 @@ async function activateWorld(name) {
   });
 }
 
-function downloadWorld(name) {
-  window.location.href = `/api/worlds/${encodeURIComponent(name)}/download`;
+async function downloadWorld(btn, name) {
+  if (_locks.has('download')) return;
+  _locks.add('download');
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Zipping…';
+  try {
+    const res = await fetch(`/api/worlds/${encodeURIComponent(name)}/download`);
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.error || `HTTP ${res.status}`);
+    }
+    btn.textContent = 'Downloading…';
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${name}.zip`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch (err) {
+    alert('Download failed: ' + err.message);
+  } finally {
+    _locks.delete('download');
+    btn.disabled = false;
+    btn.textContent = orig;
+  }
 }
 
 // ── Properties Modal ──────────────────────────────────────────────────────────

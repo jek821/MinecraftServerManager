@@ -84,8 +84,8 @@ def _relay_bidirectional(a: socket.socket, b: socket.socket) -> None:
     t2 = threading.Thread(target=pump, args=(b, a), daemon=True)
     t1.start()
     t2.start()
-    t1.join(timeout=300)
-    t2.join(timeout=300)
+    t1.join(timeout=3600)
+    t2.join(timeout=3600)
     for s in (a, b):
         try:
             s.close()
@@ -114,13 +114,15 @@ def _handle_client(
     ssl_context: ssl.SSLContext | None,
 ) -> None:
     try:
-        client.settimeout(120)
+        is_http = _is_http_peek(client)
+        # Large world downloads can take minutes before the first byte is sent.
+        client.settimeout(3600 if is_http else 120)
 
         if ssl_context and _is_tls_peek(client):
             client = ssl_context.wrap_socket(client, server_side=True)
-            client.settimeout(120)
+            client.settimeout(3600 if is_http else 120)
 
-        if _is_http_peek(client) or isinstance(client, ssl.SSLSocket):
+        if is_http or isinstance(client, ssl.SSLSocket):
             buf = _read_http_request(client)
             buf = _inject_forwarded_for(buf, client_addr[0])
             _method, path = _parse_http(buf)
