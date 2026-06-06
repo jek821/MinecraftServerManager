@@ -5,6 +5,7 @@ let _propsWorld = null;
 let _imagesWorld = null;
 let _deleteWorld = null;
 let _serverHost = '';
+let _publicPort = 25565;
 let _giveWorld = null;
 let _selectedPlayer = null;
 let _selectedPainting = null;
@@ -148,6 +149,7 @@ async function loadWorlds() {
     }
     grid.innerHTML = '';
     worlds.forEach(w => grid.appendChild(buildWorldCard(w)));
+    applyServerGatedButtons();
   } catch (err) {
     grid.innerHTML = `<p class="loading" style="color:var(--danger)">${err.message}</p>`;
   }
@@ -184,10 +186,65 @@ function esc(str) {
   return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
+function _serverState() {
+  return _lastServerStatus.state || 'stopped';
+}
+
+function _isManagedServerRunning() {
+  return _serverState() === 'running';
+}
+
+function _isServerBusy() {
+  if (_serverPending) return true;
+  return ['running', 'starting', 'stopping', 'pregen', 'generating'].includes(_serverState());
+}
+
+function _worldActionBlocked(action, worldName) {
+  if (!_isServerBusy()) return false;
+  if (['activate', 'delete', 'rename', 'pregen'].includes(action)) return true;
+  if (_isManagedServerRunning() && worldName === _lastServerStatus.world) {
+    return ['download', 'properties', 'images'].includes(action);
+  }
+  return false;
+}
+
+function applyServerGatedButtons() {
+  const busy = _isServerBusy();
+  const running = _isManagedServerRunning();
+  const active = _lastServerStatus.world;
+
+  document.getElementById('newWorldBtn').disabled = busy;
+  const uploadInput = document.getElementById('uploadWorldInput');
+  uploadInput.disabled = busy;
+  document.querySelector('label[for="uploadWorldInput"]')?.classList.toggle('is-disabled', busy);
+  document.getElementById('updateJarBtn').disabled = busy;
+
+  document.querySelectorAll('#worldsGrid [data-action]').forEach(btn => {
+    const blocked = _worldActionBlocked(btn.dataset.action, btn.dataset.world);
+    btn.disabled = blocked;
+    btn.title = blocked ? 'Stop the server first' : '';
+  });
+
+  const saveProps = document.getElementById('savePropsBtn');
+  if (saveProps && !_locks.has('saveProps')) {
+    saveProps.disabled = !!(running && _propsWorld && _propsWorld === active);
+  }
+
+  const applyPaintings = document.getElementById('applyPaintingsBtn');
+  const imageInput = document.getElementById('imageFileInput');
+  const imageLabel = document.querySelector('label[for="imageFileInput"]');
+  const imagesBlocked = !!(running && _imagesWorld && _imagesWorld === active);
+  if (applyPaintings && !_locks.has('imageUpload') && !_rebuildInFlight) {
+    applyPaintings.disabled = imagesBlocked;
+  }
+  if (imageInput) imageInput.disabled = imagesBlocked || _locks.has('imageUpload');
+  if (imageLabel) imageLabel.classList.toggle('is-disabled', imagesBlocked);
+}
+
 // Delegate all world card button clicks
 document.getElementById('worldsGrid').addEventListener('click', async (e) => {
   const btn = e.target.closest('[data-action]');
-  if (!btn) return;
+  if (!btn || btn.disabled) return;
   const action = btn.dataset.action;
   const name = btn.dataset.world;
 
@@ -197,7 +254,7 @@ document.getElementById('worldsGrid').addEventListener('click', async (e) => {
     try {
       await activateWorld(name);
     } finally {
-      btn.disabled = false;
+      applyServerGatedButtons();
     }
   }
   if (action === 'download')    await downloadWorld(btn, name);
@@ -205,7 +262,10 @@ document.getElementById('worldsGrid').addEventListener('click', async (e) => {
   if (action === 'images')      await openImages(name);
   if (action === 'pregen')      openPregen(name);
   if (action === 'delete')      openDeleteConfirm(name);
-  if (action === 'rename')      startRename(btn, name);
+  if (action === 'rename') {
+    if (_worldActionBlocked('rename', name)) return;
+    startRename(btn, name);
+  }
 });
 
 function startRename(btn, name) {
@@ -314,11 +374,13 @@ async function downloadWorld(btn, name) {
 
 // ── Properties Modal ──────────────────────────────────────────────────────────
 async function openProperties(name) {
+  if (_worldActionBlocked('properties', name)) return;
   const gen = ++_propsOpenGen;
   _propsWorld = name;
   document.getElementById('propsModalTitle').textContent = `${name} — server.properties`;
   document.getElementById('propsEditor').value = 'Loading…';
   openModal('propsModal');
+  applyServerGatedButtons();
   try {
     const data = await apiJson('GET', `/api/worlds/${encodeURIComponent(name)}/properties`);
     if (gen !== _propsOpenGen) return;
@@ -350,6 +412,7 @@ document.getElementById('savePropsBtn').addEventListener('click', async () => {
 
 // ── Images Modal ──────────────────────────────────────────────────────────────
 async function openImages(name) {
+  if (_worldActionBlocked('images', name)) return;
   const gen = ++_imagesOpenGen;
   _imagesWorld = name;
   document.getElementById('imagesModalTitle').textContent = `${name} — Painting Images`;
@@ -357,11 +420,12 @@ async function openImages(name) {
   const warn = document.getElementById('imagesHostWarning');
   warn.classList.toggle('hidden', !!_serverHost);
   openModal('imagesModal');
+  applyServerGatedButtons();
   await refreshImages(gen);
-  if (gen === _imagesOpenGen) rebuildPaintingsForWorld(name);
+  if (gen === _imagesOpenGen) rebuildPaintingsForWorld(name, gen);
 }
 
-async function rebuildPaintingsForWorld(name) {
+async function rebuildPaintingsForWorld(name, expectedGen) {
   if (_rebuildInFlight) return;
   _rebuildInFlight = true;
   const btn = document.getElementById('applyPaintingsBtn');
@@ -369,30 +433,37 @@ async function rebuildPaintingsForWorld(name) {
   if (btn) { btn.disabled = true; btn.textContent = 'Applying…'; }
   try {
     const data = await apiJson('POST', `/api/worlds/${encodeURIComponent(name)}/rebuild-paintings`);
-    if (status) {
-      const pack = data.pack || {};
-      let msg = 'Applied to world — restart the server for changes to take effect.';
-      if (pack.url) {
-        msg += `\nPack URL: ${pack.url}`;
-        if (pack.image_count === 0) {
-          msg += '\n⚠ No images uploaded yet — pack is empty.';
+    if (expectedGen == null || expectedGen === _imagesOpenGen) {
+      if (status) {
+        const pack = data.pack || {};
+        let msg = 'Applied to world — restart the server for changes to take effect.';
+        if (pack.url) {
+          msg += `\nPack URL: ${pack.url}`;
+          if (pack.image_count === 0) {
+            msg += '\n⚠ No images uploaded yet — pack is empty.';
+          }
+          if (pack.test && !pack.test.ok) {
+            msg += `\n⚠ Server self-test failed: ${pack.test.error || 'HTTP ' + (pack.test.status || '?')}`;
+            msg += '\nRun from another network: curl -I ' + pack.url;
+          }
         }
-        if (pack.test && !pack.test.ok) {
-          msg += `\n⚠ Server self-test failed: ${pack.test.error || 'HTTP ' + (pack.test.status || '?')}`;
-          msg += '\nRun from another network: curl -I ' + pack.url;
-        }
+        status.textContent = msg;
+        status.className = 'status-text ' + (pack.test && !pack.test.ok ? 'err' : 'ok');
+        status.style.whiteSpace = 'pre-wrap';
       }
-      status.textContent = msg;
-      status.className = 'status-text ' + (pack.test && !pack.test.ok ? 'err' : 'ok');
-      status.style.whiteSpace = 'pre-wrap';
     }
   } catch (err) {
-    if (status) {
-      status.textContent = 'Apply failed: ' + err.message;
-      status.className = 'status-text err';
+    if (expectedGen == null || expectedGen === _imagesOpenGen) {
+      if (status) {
+        status.textContent = 'Apply failed: ' + err.message;
+        status.className = 'status-text err';
+      }
     }
   }
-  if (btn) { btn.disabled = false; btn.textContent = 'Apply to World'; }
+  if (expectedGen == null || expectedGen === _imagesOpenGen) {
+    if (btn) { btn.disabled = false; btn.textContent = 'Apply to World'; }
+    applyServerGatedButtons();
+  }
   _rebuildInFlight = false;
 }
 
@@ -488,27 +559,59 @@ document.getElementById('imageFileInput').addEventListener('change', async (e) =
 });
 
 // ── Delete Modal ──────────────────────────────────────────────────────────────
+function _resetDeleteModal() {
+  const input = document.getElementById('deleteConfirmInput');
+  const btn = document.getElementById('confirmDeleteBtn');
+  const field = document.getElementById('deleteConfirmField');
+  input.value = '';
+  input.disabled = false;
+  btn.disabled = true;
+  btn.textContent = 'Delete';
+  field.classList.remove('hidden');
+}
+
+function _updateDeleteConfirmBtn() {
+  const input = document.getElementById('deleteConfirmInput');
+  const btn = document.getElementById('confirmDeleteBtn');
+  if (_locks.has('delete')) return;
+  btn.disabled = input.value !== _deleteWorld;
+}
+
 function openDeleteConfirm(name) {
+  if (_worldActionBlocked('delete', name)) return;
   if (_locks.has('delete')) {
     alert('A delete is already in progress.');
     return;
   }
   _deleteWorld = name;
   document.getElementById('deleteModalText').textContent =
-    `Are you sure you want to permanently delete "${name}"? This cannot be undone.`;
+    `This permanently deletes all files for "${name}". This cannot be undone.`;
+  document.getElementById('deleteConfirmName').textContent = name;
+  _resetDeleteModal();
   openModal('deleteModal');
+  document.getElementById('deleteConfirmInput').focus();
 }
 
 let _stopDeletePoll = null;
 
+document.getElementById('deleteConfirmInput').addEventListener('input', _updateDeleteConfirmBtn);
+
 document.getElementById('confirmDeleteBtn').addEventListener('click', async () => {
   if (!_deleteWorld || _locks.has('delete')) return;
+  const input = document.getElementById('deleteConfirmInput');
+  if (input.value !== _deleteWorld) {
+    alert('World name does not match.');
+    return;
+  }
+
   _locks.add('delete');
   const btn = document.getElementById('confirmDeleteBtn');
   const status = document.getElementById('deleteModalText');
-  const origText = status.textContent;
+  const field = document.getElementById('deleteConfirmField');
   btn.disabled = true;
   btn.textContent = 'Deleting…';
+  input.disabled = true;
+  field.classList.add('hidden');
   setModalLocked('deleteModal', true);
   if (_stopDeletePoll) _stopDeletePoll();
 
@@ -523,29 +626,29 @@ document.getElementById('confirmDeleteBtn').addEventListener('click', async () =
         _stopDeletePoll = null;
         _locks.delete('delete');
         setModalLocked('deleteModal', false);
-        btn.disabled = false;
-        btn.textContent = 'Delete';
-        status.textContent = origText;
         if (job.status === 'done') {
+          _deleteWorld = null;
           closeModal('deleteModal');
           loadWorlds();
         } else {
           alert('Delete failed: ' + (job.error || 'Unknown error'));
+          _resetDeleteModal();
+          status.textContent =
+            `This permanently deletes all files for "${document.getElementById('deleteConfirmName').textContent}". This cannot be undone.`;
         }
       },
     });
   } catch (err) {
     _locks.delete('delete');
     setModalLocked('deleteModal', false);
-    btn.disabled = false;
-    btn.textContent = 'Delete';
+    _resetDeleteModal();
     alert('Delete failed: ' + err.message);
   }
 });
 
 // ── New World / Generate ──────────────────────────────────────────────────────
 document.getElementById('uploadWorldInput').addEventListener('change', async (e) => {
-  if (_locks.has('worldUpload')) return;
+  if (_isServerBusy() || _locks.has('worldUpload')) return;
   const file = e.target.files[0];
   if (!file) return;
   e.target.value = '';
@@ -571,7 +674,7 @@ document.getElementById('uploadWorldInput').addEventListener('change', async (e)
 let _stopGeneratePoll = null;
 
 document.getElementById('newWorldBtn').addEventListener('click', () => {
-  if (_locks.has('generate')) return;
+  if (_isServerBusy() || _locks.has('generate')) return;
   if (_stopGeneratePoll) _stopGeneratePoll();
   document.getElementById('newWorldName').value = '';
   document.getElementById('inheritProps').checked = true;
@@ -689,6 +792,7 @@ function _resetPregenModal() {
 }
 
 function openPregen(name) {
+  if (_worldActionBlocked('pregen', name)) return;
   if (_pregenRunning && _pregenPollWorld && _pregenPollWorld !== name) {
     alert(`Pre-generation is already running for ${_pregenPollWorld}. Cancel it first.`);
     return;
@@ -815,7 +919,7 @@ async function loadJars() {
 }
 
 document.getElementById('updateJarBtn').addEventListener('click', async () => {
-  if (_locks.has('jarUpdate')) return;
+  if (_isServerBusy() || _locks.has('jarUpdate')) return;
   const url = document.getElementById('jarUrl').value.trim();
   const statusEl = document.getElementById('jarUpdateStatus');
 
@@ -972,6 +1076,7 @@ async function loadSettings() {
   try {
     const cfg = await apiJson('GET', '/api/config');
     _serverHost = cfg.server_host || '';
+    _publicPort = cfg.public_port || 25565;
     document.getElementById('jvmArgs').value = cfg.jvm_args || '';
     refreshServerIconPreview(!!cfg.has_server_icon);
     try {
@@ -1065,7 +1170,7 @@ document.getElementById('saveSettingsBtn').addEventListener('click', async () =>
   _locks.add('saveSettings');
   try {
     const motd = document.getElementById('motdInput').value;
-    const data = await apiJson('POST', '/api/config', { server_host: host, public_port: 25565, jvm_args: jvmArgs });
+    const data = await apiJson('POST', '/api/config', { server_host: host, public_port: _publicPort, jvm_args: jvmArgs });
     try { await apiJson('POST', '/api/server/motd', { motd }); } catch { /* no active world */ }
     _serverHost = host;
     const rebuilt = data.rebuilt_worlds || 0;
@@ -1197,6 +1302,8 @@ function updateServerHud(data) {
   if (playable && !document.getElementById('serverLogsBody').classList.contains('hidden')) {
     loadServerLogs();
   }
+
+  applyServerGatedButtons();
 }
 
 document.getElementById('copyAddressBtn').addEventListener('click', async () => {

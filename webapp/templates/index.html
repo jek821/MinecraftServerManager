@@ -397,9 +397,16 @@
         <button class="modal-close" data-close="deleteModal">✕</button>
       </div>
       <p id="deleteModalText" class="modal-body-text"></p>
+      <div id="deleteConfirmField" class="delete-confirm-field">
+        <label for="deleteConfirmInput">
+          Type <strong id="deleteConfirmName"></strong> to confirm:
+        </label>
+        <input type="text" id="deleteConfirmInput" class="delete-confirm-input"
+          autocomplete="off" spellcheck="false" placeholder="World name" />
+      </div>
       <div class="modal-footer">
         <button class="btn btn-ghost" data-close="deleteModal">Cancel</button>
-        <button class="btn btn-danger" id="confirmDeleteBtn">Delete</button>
+        <button class="btn btn-danger" id="confirmDeleteBtn" disabled>Delete</button>
       </div>
     </div>
   </div>

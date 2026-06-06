@@ -81,6 +81,7 @@ _pregen_handles_lock = threading.Lock()
 
 _server_proc: 'subprocess.Popen | None' = None
 _server_start_time: float | None = None
+_server_stopping = False
 _server_lock = threading.Lock()
 _config_lock = threading.Lock()
 _rcon_write_lock = threading.Lock()
@@ -122,7 +123,11 @@ def load_config() -> dict:
     }
     dirty = False
     if CONFIG_FILE.exists():
-        saved = json.loads(CONFIG_FILE.read_text())
+        try:
+            saved = json.loads(CONFIG_FILE.read_text())
+        except json.JSONDecodeError as e:
+            app.logger.error('Invalid config.json (%s) — using defaults', e)
+            saved = {}
         defaults.update(saved)
         # Legacy "port" was the old Flask/resource-pack port — not the public MC port.
         if 'port' in saved:
@@ -150,6 +155,13 @@ def _mc_internal_port() -> int:
 
 def _public_port() -> int:
     return int(load_config().get('public_port', DEFAULT_PUBLIC_PORT))
+
+
+def _validate_public_port(port: int, internal: int | None = None) -> None:
+    internal = internal if internal is not None else _mc_internal_port()
+    reserved = {FLASK_PORT, PACK_PORT, internal, 5000}
+    if port in reserved:
+        raise ValueError(f'Port {port} conflicts with internal services')
 
 
 def _is_private_host(host: str) -> bool:
@@ -789,6 +801,14 @@ def _server_address() -> str:
     return f'{host}:{_public_port()}' if host else ''
 
 
+def _is_mc_live() -> bool:
+    try:
+        _mc_status_ping('localhost', _mc_internal_port())
+        return True
+    except Exception:
+        return False
+
+
 def _rcon_on_active(command: str) -> str | None:
     world_dir = _active_world_dir()
     if not world_dir:
@@ -796,9 +816,7 @@ def _rcon_on_active(command: str) -> str | None:
     cfg = _rcon_settings(world_dir)
     if not cfg['enabled'] or not cfg['password']:
         return None
-    try:
-        _mc_status_ping('localhost', _mc_internal_port())
-    except Exception:
+    if not _is_mc_live():
         return None
     try:
         return _rcon_exec('localhost', cfg['port'], cfg['password'], command)
@@ -1067,6 +1085,8 @@ def activate_world(name):
         return jsonify({'error': 'A background job is running for this world'}), 400
     if _managed_server_running():
         return jsonify({'error': 'Stop the server before changing the active world'}), 400
+    if _background_mc_jobs_running():
+        return jsonify({'error': 'Wait for background server tasks to finish'}), 400
     with _config_lock:
         config = load_config()
         config['active_world'] = name
@@ -1286,7 +1306,7 @@ def _world_has_running_job(world_name: str, job_type: str | None = None) -> bool
 
 
 def _world_dir_busy(world_name: str) -> bool:
-    return _world_has_running_job(world_name) or _background_mc_jobs_running()
+    return _world_has_running_job(world_name)
 
 
 _MAX_FINISHED_JOBS = 50
@@ -1301,7 +1321,9 @@ def _prune_finished_jobs() -> None:
         if len(finished) <= _MAX_FINISHED_JOBS:
             return
         finished.sort(key=lambda item: item[1].get('finished_at', 0))
-        for jid, _ in finished[: len(finished) - _MAX_FINISHED_JOBS]:
+        for jid, job in finished[: len(finished) - _MAX_FINISHED_JOBS]:
+            if job.get('zip_path'):
+                continue
             _jobs.pop(jid, None)
 
 
@@ -1399,7 +1421,7 @@ def delete_world(name):
 def delete_status(job_id):
     with _jobs_lock:
         job = _jobs.get(job_id)
-    if not job:
+    if not job or job.get('type') != 'delete':
         return jsonify({'error': 'Job not found'}), 404
     return jsonify(job)
 
@@ -1462,6 +1484,8 @@ def upload_world():
     world_dir = WORLDS_DIR / world_name
     if world_dir.exists():
         return jsonify({'error': f'A world named "{world_name}" already exists'}), 409
+    if _mc_port_busy():
+        return jsonify({'error': 'Stop the server and background tasks before uploading a world'}), 400
     job_id = _try_reserve_job(world_name, 'upload')
     if not job_id:
         return jsonify({'error': 'A background job is already running for this world'}), 400
@@ -1473,25 +1497,17 @@ def upload_world():
             return jsonify({'error': f'A world named "{world_name}" already exists'}), 409
         data = file.read()
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
-            # Detect whether the zip has a single top-level folder (common for world exports)
             names = zf.namelist()
             top = {n.split('/')[0] for n in names if n.strip('/')}
-            if len(top) == 1:
-                prefix = next(iter(top)) + '/'
-                world_dir.mkdir(parents=True, exist_ok=False)
-                for member in zf.infolist():
-                    rel = member.filename[len(prefix):]
-                    if not rel:
-                        continue
-                    dest = world_dir / rel
-                    if member.filename.endswith('/'):
-                        dest.mkdir(parents=True, exist_ok=True)
-                    else:
-                        dest.parent.mkdir(parents=True, exist_ok=True)
-                        dest.write_bytes(zf.read(member.filename))
-            else:
-                world_dir.mkdir(parents=True, exist_ok=False)
-                zf.extractall(world_dir)
+            prefix = next(iter(top)) + '/' if len(top) == 1 else ''
+            world_dir.mkdir(parents=True, exist_ok=False)
+            for member in zf.infolist():
+                rel = member.filename[len(prefix):] if prefix else member.filename
+                if not rel or rel.endswith('/'):
+                    continue
+                dest = safe_child(world_dir, rel)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(zf.read(member.filename))
         (world_dir / 'eula.txt').write_text('eula=true\n')
         try:
             rebuild_paintings(world_dir)
@@ -1597,12 +1613,15 @@ def _run_generate(job_id: str, new_name: str, inherit_properties: bool, old_acti
         if not world_done:
             raise RuntimeError('Server timed out or exited before world generation completed')
 
-        # Mark new world as active
         with _config_lock:
             config = load_config()
-            config['active_world'] = new_name
-            CONFIG_FILE.write_text(json.dumps(config, indent=2))
-        log(f'Set "{new_name}" as active world.')
+            current = config.get('active_world')
+            if current is None or current == old_active:
+                config['active_world'] = new_name
+                CONFIG_FILE.write_text(json.dumps(config, indent=2))
+                log(f'Set "{new_name}" as active world.')
+            else:
+                log(f'Left active world as "{current}" (changed during generation).')
 
         try:
             rebuild_paintings(new_dir)
@@ -1795,6 +1814,7 @@ def _run_pregen(job_id: str, world_name: str, center_x: int, center_z: int, radi
     proc: subprocess.Popen | None = None
     cfg: dict | None = None
     cancelled = False
+    failed = False
 
     def log(msg: str):
         with _jobs_lock:
@@ -1941,6 +1961,7 @@ def _run_pregen(job_id: str, world_name: str, center_x: int, center_z: int, radi
                                 prog_out = rcon('chunky progress')
                             except RCONError as e:
                                 log(f'RCON error: {e}')
+                                failed = True
                                 break
                             pct = _chunky_progress_pct(prog_out)
                             if pct is not None:
@@ -1965,6 +1986,8 @@ def _run_pregen(job_id: str, world_name: str, center_x: int, center_z: int, radi
     else:
         if cancelled:
             set_status('cancelled')
+        elif failed:
+            set_status('error', 'Lost contact with server during pre-generation')
         else:
             set_status('done')
     finally:
@@ -2315,10 +2338,12 @@ def save_config_endpoint():
             try:
                 port = int(data['public_port'])
                 if port < 1 or port > 65535:
-                    raise ValueError
+                    raise ValueError('out of range')
+                _validate_public_port(port, int(config.get('mc_internal_port', DEFAULT_MC_INTERNAL_PORT)))
                 config['public_port'] = port
-            except (ValueError, TypeError):
-                return jsonify({'error': 'Invalid port'}), 400
+            except (ValueError, TypeError) as e:
+                msg = str(e) if str(e) != 'out of range' else 'Invalid port'
+                return jsonify({'error': msg}), 400
         if 'jvm_args' in data:
             config['jvm_args'] = str(data['jvm_args']).strip()
         CONFIG_FILE.write_text(json.dumps(config, indent=2))
@@ -2432,7 +2457,10 @@ def set_whitelist_enabled():
     enabled = bool(data.get('enabled', False))
     _set_whitelist_enabled(world_dir, enabled)
     cmd = 'whitelist on' if enabled else 'whitelist off'
-    _rcon_on_active(cmd)
+    if _is_mc_live() and _rcon_on_active(cmd) is None:
+        return jsonify({
+            'error': 'Whitelist saved but could not apply via RCON — restart the server',
+        }), 503
     return jsonify({'ok': True, 'enabled': enabled})
 
 
@@ -2448,7 +2476,9 @@ def whitelist_add():
     entries = _read_whitelist(world_dir)
     if any(e.get('name', '').lower() == player.lower() for e in entries):
         return jsonify({'error': 'Player already whitelisted'}), 409
-    if _rcon_on_active(f'whitelist add {player}') is not None:
+    if _is_mc_live():
+        if _rcon_on_active(f'whitelist add {player}') is None:
+            return jsonify({'error': 'Server is running but RCON command failed'}), 503
         entries = _read_whitelist(world_dir)
     else:
         entries.append({'uuid': _offline_player_uuid(player), 'name': player})
@@ -2464,8 +2494,9 @@ def whitelist_remove(player):
         return jsonify({'error': 'No active world'}), 404
     if not re.match(r'^[a-zA-Z0-9_]{1,16}$', player):
         return jsonify({'error': 'Invalid player name'}), 400
-    if _rcon_on_active(f'whitelist remove {player}') is not None:
-        pass
+    if _is_mc_live():
+        if _rcon_on_active(f'whitelist remove {player}') is None:
+            return jsonify({'error': 'Server is running but RCON command failed'}), 503
     else:
         entries = [e for e in _read_whitelist(world_dir) if e.get('name', '').lower() != player.lower()]
         _write_whitelist(world_dir, entries)
@@ -2561,6 +2592,8 @@ def get_server_status():
 def start_server():
     global _server_proc, _server_start_time
     with _server_lock:
+        if _server_stopping:
+            return jsonify({'error': 'Server is still stopping — try again in a moment'}), 400
         if _server_proc is not None and _server_proc.poll() is None:
             return jsonify({'error': 'Server is already running'}), 400
         if _background_mc_jobs_running():
@@ -2587,6 +2620,9 @@ def start_server():
     java_cmd = config.get('java_cmd', 'java')
     jvm_args = shlex.split(config.get('jvm_args', _AIKAR_FLAGS))
 
+    if _mc_port_busy():
+        return jsonify({'error': 'Minecraft port is in use — wait for the server to finish stopping'}), 400
+
     try:
         proc = subprocess.Popen(
             [java_cmd, *jvm_args, '-jar', str(jar), '--nogui'],
@@ -2600,6 +2636,14 @@ def start_server():
         return jsonify({'error': str(e)}), 500
 
     with _server_lock:
+        if _server_stopping:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            return jsonify({'error': 'Server is still stopping — try again in a moment'}), 400
         if _server_proc is not None and _server_proc.poll() is None:
             proc.terminate()
             try:
@@ -2624,39 +2668,46 @@ def start_server():
 @app.route('/api/server/stop', methods=['POST'])
 @require_auth
 def stop_server():
-    global _server_proc, _server_start_time
+    global _server_proc, _server_start_time, _server_stopping
     if _background_mc_jobs_running():
         return jsonify({
             'error': 'A background server task is running — cancel or wait for it to finish first',
         }), 400
 
-    config = load_config()
-    active_world = config.get('active_world')
-
-    rcon_sent = False
-    if active_world:
-        world_dir = WORLDS_DIR / active_world
-        cfg = _rcon_settings(world_dir)
-        if cfg['enabled'] and cfg['password']:
-            try:
-                _rcon_exec('localhost', cfg['port'], cfg['password'], 'stop')
-                rcon_sent = True
-            except Exception:
-                pass
-
     with _server_lock:
         proc = _server_proc
+        had_managed = proc is not None and proc.poll() is None
         _server_proc = None
         _server_start_time = None
+        if had_managed:
+            _server_stopping = True
 
-    if proc is not None and proc.poll() is None:
-        if not rcon_sent:
-            proc.terminate()
-        try:
-            proc.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
+    rcon_sent = False
+    if had_managed:
+        config = load_config()
+        active_world = config.get('active_world')
+        if active_world:
+            world_dir = WORLDS_DIR / active_world
+            cfg = _rcon_settings(world_dir)
+            if cfg['enabled'] and cfg['password']:
+                try:
+                    _rcon_exec('localhost', cfg['port'], cfg['password'], 'stop')
+                    rcon_sent = True
+                except Exception:
+                    pass
+
+    try:
+        if proc is not None and proc.poll() is None:
+            if not rcon_sent:
+                proc.terminate()
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+    finally:
+        with _server_lock:
+            _server_stopping = False
 
     return jsonify({'ok': True})
 

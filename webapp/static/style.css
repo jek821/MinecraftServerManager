@@ -131,7 +131,13 @@ main {
   white-space: nowrap;
 }
 .btn:hover { filter: brightness(1.15); }
-.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn:disabled,
+.btn.is-disabled,
+label.btn.is-disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  pointer-events: none;
+}
 
 .btn-primary  { background: var(--accent);    color: #0a1a0f; }
 .btn-secondary{ background: var(--surface2);  color: var(--text); border: 1px solid var(--border); }
@@ -329,6 +335,32 @@ main {
   padding: 1rem 1.25rem;
   color: var(--text-muted);
   line-height: 1.5;
+}
+
+.delete-confirm-field {
+  padding: 0 1.25rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.delete-confirm-field label {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
+.delete-confirm-field strong {
+  color: var(--text);
+}
+
+.delete-confirm-input {
+  background: var(--bg-input, #1a1a2e);
+  border: 1px solid var(--border, #334155);
+  border-radius: 6px;
+  color: var(--text-primary, #e2e8f0);
+  font-size: 0.9rem;
+  padding: 0.5rem 0.65rem;
+  width: 100%;
 }
 
 /* ── Properties Editor ───────────────────────────────────────────────────── */
