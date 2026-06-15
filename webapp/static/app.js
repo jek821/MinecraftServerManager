@@ -436,8 +436,10 @@ async function rebuildPaintingsForWorld(name, expectedGen) {
     if (expectedGen == null || expectedGen === _imagesOpenGen) {
       if (status) {
         const pack = data.pack || {};
-        let msg = 'Applied to world — restart the server for changes to take effect.';
-        if (pack.url) {
+      let msg = 'Applied to world — restart the server for changes to take effect.';
+      if (pack.hint) {
+        msg = pack.hint;
+      } else if (pack.url) {
           msg += `\nPack URL: ${pack.url}`;
           if (pack.image_count === 0) {
             msg += '\n⚠ No images uploaded yet — pack is empty.';
@@ -534,6 +536,7 @@ document.getElementById('imageFileInput').addEventListener('change', async (e) =
     status.className = 'status-text';
 
     let ok = 0, fail = 0;
+    let lastHint = '';
     for (const file of files) {
       const fd = new FormData();
       fd.append('image', file);
@@ -543,14 +546,25 @@ document.getElementById('imageFileInput').addEventListener('change', async (e) =
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error);
+        if (data.hint) lastHint = data.hint;
         ok++;
-      } catch {
+      } catch (err) {
         fail++;
+        if (files.length === 1) {
+          status.textContent = '✘ ' + (err.message || 'Upload failed');
+          status.className = 'status-text err';
+          input.value = '';
+          await refreshImages();
+          return;
+        }
       }
     }
 
-    status.textContent = `${ok} uploaded${fail ? `, ${fail} failed` : ''}`;
+    let msg = `${ok} uploaded${fail ? `, ${fail} failed` : ''}`;
+    if (ok && lastHint) msg += `\n${lastHint}`;
+    status.textContent = msg;
     status.className = 'status-text ' + (fail ? 'err' : 'ok');
+    if (lastHint) status.style.whiteSpace = 'pre-wrap';
     input.value = '';
     await refreshImages();
   } finally {

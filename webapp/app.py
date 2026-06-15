@@ -721,6 +721,28 @@ def _painting_stem(filename: str) -> str:
     return Path(filename).stem.lower().replace(' ', '_').replace('-', '_').replace('.', '_')
 
 
+def _validate_painting_name(filename: str, paintings_dir: Path, *, replace: str | None = None) -> str | None:
+    """Return an error string, or None if the painting name is usable."""
+    stem = _painting_stem(filename)
+    if not re.match(r'^[a-z][a-z0-9_]*$', stem):
+        return (
+            f'"{Path(filename).stem}" is not a valid painting id — use letters, numbers, '
+            'and underscores; must start with a letter'
+        )
+    if paintings_dir.exists():
+        for existing in paintings_dir.iterdir():
+            if not _is_image_file(existing):
+                continue
+            if replace and existing.name == replace:
+                continue
+            if _painting_stem(existing.name) == stem:
+                return (
+                    f'"{filename}" conflicts with "{existing.name}" '
+                    f'(both map to painting id "{stem}")'
+                )
+    return None
+
+
 def _image_block_dims(path: Path) -> tuple[int, int]:
     """Return (width_blocks, height_blocks) scaled to fit within 4×4 blocks."""
     try:
@@ -737,6 +759,20 @@ def _image_block_dims(path: Path) -> tuple[int, int]:
         return 1, 1
 
 
+def _image_to_painting_png(path: Path) -> bytes:
+    """Resize image to the exact pixel size Minecraft expects for its block dimensions."""
+    w_blocks, h_blocks = _image_block_dims(path)
+    target_w = w_blocks * 16
+    target_h = h_blocks * 16
+    with PILImage.open(path) as img:
+        img = img.convert('RGBA')
+        if img.size != (target_w, target_h):
+            img = img.resize((target_w, target_h), PILImage.Resampling.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, 'PNG')
+        return buf.getvalue()
+
+
 def _build_resource_pack_zip(paintings_dir: Path) -> bytes:
     """Build the resource-pack zip in memory from a world's paintings directory."""
     buf = io.BytesIO()
@@ -748,14 +784,7 @@ def _build_resource_pack_zip(paintings_dir: Path) -> bytes:
                     continue
                 stem = _painting_stem(img_path.name)
                 dest = f'assets/{PAINTINGS_NS}/textures/painting/{stem}.png'
-                if img_path.suffix.lower() == '.png':
-                    zf.write(img_path, dest)
-                else:
-                    # Convert JPEG → PNG
-                    with PILImage.open(img_path) as img:
-                        png_buf = io.BytesIO()
-                        img.convert('RGBA').save(png_buf, 'PNG')
-                    zf.writestr(dest, png_buf.getvalue())
+                zf.writestr(dest, _image_to_painting_png(img_path))
     return buf.getvalue()
 
 
@@ -1039,6 +1068,14 @@ def _rebuild_paintings_locked(world_dir: Path) -> dict:
         _ensure_mc_internal_port(world_dir)
 
     _ensure_rcon(world_dir)
+    pack_info['reloaded'] = False
+    if _is_mc_live():
+        pack_info['reloaded'] = _rcon_on_active('reload') is not None
+    pack_info['needs_restart'] = True
+    pack_info['hint'] = (
+        'Restart the server, then leave and rejoin the world so your client '
+        'downloads the updated resource pack.'
+    )
     return pack_info
 
 
@@ -1365,10 +1402,21 @@ def upload_image(name):
     filename = Path(original).stem + ext  # normalise extension to lowercase
     paintings_dir = _paintings_dir(world_dir)
     paintings_dir.mkdir(parents=True, exist_ok=True)
+    name_err = _validate_painting_name(filename, paintings_dir)
+    if name_err:
+        return jsonify({'error': name_err}), 400
     file.save(paintings_dir / filename)
-    rebuild_paintings(world_dir)
+    pack_info = rebuild_paintings(world_dir)
     w, h = _image_block_dims(paintings_dir / filename)
-    return jsonify({'ok': True, 'name': filename, 'width_blocks': w, 'height_blocks': h})
+    return jsonify({
+        'ok': True,
+        'name': filename,
+        'stem': _painting_stem(filename),
+        'width_blocks': w,
+        'height_blocks': h,
+        'pixels': [w * 16, h * 16],
+        'hint': pack_info.get('hint'),
+    })
 
 
 @app.route('/api/worlds/<name>/images/<filename>', methods=['DELETE'])
