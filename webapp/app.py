@@ -780,35 +780,35 @@ def _validate_painting_name(filename: str, paintings_dir: Path, *, replace: str 
 
 
 def _image_block_dims(path: Path) -> tuple[int, int]:
-    """Return (width_blocks, height_blocks) scaled to fit within 4×4 blocks."""
+    """Return (width_blocks, height_blocks) preserving aspect ratio, max 4 blocks per side."""
+    MAX_BLOCKS = 4
     try:
         with PILImage.open(path) as img:
             pw, ph = img.size
-        w = max(1, pw // 16)
-        h = max(1, ph // 16)
-        if w > 4 or h > 4:
-            scale = 4 / max(w, h)
-            w = max(1, round(w * scale))
-            h = max(1, round(h * scale))
+        if pw <= 0 or ph <= 0:
+            return 1, 1
+        if ph >= pw:
+            h = MAX_BLOCKS
+            w = max(1, min(MAX_BLOCKS, round(pw * MAX_BLOCKS / ph)))
+        else:
+            w = MAX_BLOCKS
+            h = max(1, min(MAX_BLOCKS, round(ph * MAX_BLOCKS / pw)))
         return w, h
     except Exception:
         return 1, 1
 
 
 def _image_to_painting_png(path: Path) -> bytes:
-    """Prepare a painting texture at full resolution (Minecraft scales it to the wall size)."""
+    """Bake image to the exact pixel size Minecraft requires for the declared block dimensions."""
+    w_blocks, h_blocks = _image_block_dims(path)
+    target_w = w_blocks * 16
+    target_h = h_blocks * 16
     with PILImage.open(path) as img:
-        if path.suffix.lower() == '.png':
-            if img.mode in ('RGB', 'L', 'P'):
-                return path.read_bytes()
-            if img.mode == 'RGBA':
-                alpha_min, alpha_max = img.getchannel('A').getextrema()
-                if alpha_min == 255:
-                    return path.read_bytes()
         img = img.convert('RGBA')
-        # Paintings ignore transparency — partial alpha renders fully invisible.
         flat = PILImage.new('RGBA', img.size, (255, 255, 255, 255))
         img = PILImage.alpha_composite(flat, img).convert('RGB')
+        if img.size != (target_w, target_h):
+            img = img.resize((target_w, target_h), PILImage.Resampling.LANCZOS)
         buf = io.BytesIO()
         img.save(buf, 'PNG')
         return buf.getvalue()
