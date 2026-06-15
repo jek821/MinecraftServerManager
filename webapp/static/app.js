@@ -1345,15 +1345,26 @@ document.getElementById('stopServerBtn').addEventListener('click', async () => {
   updateServerHud(_lastServerStatus);
   try {
     await apiJson('POST', '/api/server/stop');
+    const deadline = Date.now() + 60000;
+    while (Date.now() < deadline) {
+      await loadServerStatus();
+      if (_lastServerStatus.state === 'stopped') break;
+      await new Promise(r => setTimeout(r, 1000));
+    }
+    if (_lastServerStatus.state !== 'stopped') {
+      _serverPending = null;
+      updateServerHud(_lastServerStatus);
+      alert('Server did not stop in time. Refresh the page and try again.');
+      return;
+    }
   } catch (err) {
     _serverPending = null;
     updateServerHud(_lastServerStatus);
     alert('Error: ' + err.message);
-    _locks.delete('serverAction');
     return;
+  } finally {
+    _locks.delete('serverAction');
   }
-  _locks.delete('serverAction');
-  await loadServerStatus();
 });
 
 document.getElementById('givePaintingHudBtn').addEventListener('click', async () => {

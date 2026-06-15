@@ -6,6 +6,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import socket
 import struct
 import subprocess
@@ -262,8 +263,78 @@ def _managed_server_running() -> bool:
         return _server_proc is not None and _server_proc.poll() is None
 
 
+def _mc_port_active() -> bool:
+    try:
+        _mc_status_ping('localhost', _mc_internal_port())
+        return True
+    except Exception:
+        return False
+
+
 def _mc_port_busy() -> bool:
-    return _managed_server_running() or _background_mc_jobs_running()
+    return _mc_port_active() or _background_mc_jobs_running()
+
+
+def _pids_listening_on_port(port: int) -> list[int]:
+    """PIDs listening on a TCP port (Linux /proc)."""
+    port_hex = f'{port:04X}'
+    inodes: set[str] = set()
+    for proc_net in ('/proc/net/tcp', '/proc/net/tcp6'):
+        try:
+            for line in Path(proc_net).read_text().splitlines()[1:]:
+                fields = line.split()
+                if len(fields) < 10:
+                    continue
+                if fields[3] != '0A':
+                    continue
+                if fields[1].split(':')[-1].upper() != port_hex:
+                    continue
+                inodes.add(fields[9])
+        except OSError:
+            continue
+    if not inodes:
+        return []
+    pids: list[int] = []
+    for entry in Path('/proc').iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        try:
+            for fd_link in (entry / 'fd').iterdir():
+                try:
+                    target = os.readlink(fd_link)
+                except OSError:
+                    continue
+                if target.startswith('socket:') and target.split(':', 1)[1] in inodes:
+                    pids.append(pid)
+                    break
+        except (OSError, PermissionError):
+            continue
+    return pids
+
+
+def _wait_for_mc_port_free(timeout: float) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _mc_port_active():
+            return True
+        time.sleep(0.5)
+    return not _mc_port_active()
+
+
+def _kill_mc_listeners() -> None:
+    port = _mc_internal_port()
+    for pid in _pids_listening_on_port(port):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+    if not _wait_for_mc_port_free(10):
+        for pid in _pids_listening_on_port(port):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
 
 
 def _try_reserve_job(world: str | None, job_type: str) -> str | None:
@@ -2718,16 +2789,18 @@ def stop_server():
             'error': 'A background server task is running — cancel or wait for it to finish first',
         }), 400
 
+    port_was_active = _mc_port_active()
+
     with _server_lock:
         proc = _server_proc
         had_managed = proc is not None and proc.poll() is None
         _server_proc = None
         _server_start_time = None
-        if had_managed:
+        if had_managed or port_was_active:
             _server_stopping = True
 
     rcon_sent = False
-    if had_managed:
+    if port_was_active or had_managed:
         config = load_config()
         active_world = config.get('active_world')
         if active_world:
@@ -2749,9 +2822,20 @@ def stop_server():
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
+
+        if _mc_port_active():
+            _wait_for_mc_port_free(30)
+        if _mc_port_active():
+            _kill_mc_listeners()
+            _wait_for_mc_port_free(15)
     finally:
         with _server_lock:
             _server_stopping = False
+
+    if _mc_port_active():
+        return jsonify({
+            'error': 'Server did not stop — the game process may be orphaned. Try again or kill java manually.',
+        }), 500
 
     return jsonify({'ok': True})
 
