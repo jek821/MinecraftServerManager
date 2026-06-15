@@ -421,39 +421,91 @@ async function openImages(name) {
   warn.classList.toggle('hidden', !!_serverHost);
   openModal('imagesModal');
   applyServerGatedButtons();
-  await Promise.all([refreshImages(gen), refreshPackStatus(gen)]);
+  await Promise.all([refreshImages(gen), refreshPaintingsDebug(gen)]);
   if (gen === _imagesOpenGen) rebuildPaintingsForWorld(name, gen);
 }
 
-async function refreshPackStatus(expectedGen) {
+function _debugFlag(ok, okLabel, badLabel) {
+  const cls = ok ? 'ok' : 'warn';
+  const text = ok ? okLabel : badLabel;
+  return `<span class="images-debug-flag ${cls}">${esc(text)}</span>`;
+}
+
+async function refreshPaintingsDebug(expectedGen) {
   if (!_imagesWorld) return;
-  const el = document.getElementById('imagesPackStatus');
-  if (!el) return;
+  const panel = document.getElementById('imagesDebugContent');
+  const details = document.getElementById('imagesDebugPanel');
+  if (!panel) return;
   try {
-    const info = await apiJson('GET', `/api/worlds/${encodeURIComponent(_imagesWorld)}/resource-pack-info`);
+    const d = await apiJson('GET', `/api/worlds/${encodeURIComponent(_imagesWorld)}/paintings-debug`);
     if (expectedGen != null && expectedGen !== _imagesOpenGen) return;
-    const lines = [];
-    if (!info.sha1_in_sync) {
-      lines.push('⚠ Pack file and server.properties SHA1 are out of sync — click Apply to World.');
+
+    const hasIssue = !d.sha1_in_sync || !d.pack_download_ok || d.paintings.some(p =>
+      !p.in_datapack || !p.in_pack_zip || !p.pack_matches_source
+    );
+    if (details) details.open = hasIssue;
+
+    let html = `<div class="images-debug-meta">
+      Level: <code>${esc(d.level_name)}</code> ·
+      SHA1 ${d.sha1_in_sync ? 'in sync' : '<strong style="color:var(--danger)">OUT OF SYNC</strong>'}
+      · Pack download ${d.pack_download_ok ? 'OK' : '<strong style="color:var(--danger)">FAILED</strong>'}
+      ${d.props_sha1 ? `<br>props: <code>${esc(d.props_sha1.slice(0, 12))}…</code>` : ''}
+      ${d.zip_sha1 ? ` zip: <code>${esc(d.zip_sha1.slice(0, 12))}…</code>` : ''}
+      ${d.pack_url ? `<br>URL: <code>${esc(d.pack_url)}</code>` : ''}
+    </div>`;
+
+    if (!d.paintings.length) {
+      html += '<p class="loading">No images uploaded.</p>';
     } else {
-      lines.push('✔ Resource pack SHA1 is in sync.');
+      html += d.paintings.map(p => {
+        const issue = !p.in_datapack || !p.in_pack_zip || !p.pack_matches_source;
+        const [pw, ph] = p.pixels;
+        const [bw, bh] = p.blocks;
+        const [ew, eh] = p.minecraft_expects_pixels;
+        const packPx = p.pack_texture_pixels;
+        const packPxLabel = packPx ? `${packPx[0]}×${packPx[1]}` : 'missing';
+        return `<div class="images-debug-card${issue ? ' has-issue' : ''}">
+          <h4>${esc(p.file)} <code>${esc(p.stem)}</code></h4>
+          <div class="images-debug-flags">
+            ${_debugFlag(p.in_datapack, 'In datapack', 'Missing datapack')}
+            ${_debugFlag(p.in_pack_zip, 'In pack zip', 'Missing from zip')}
+            ${_debugFlag(p.pack_matches_source, `Pack texture ${packPxLabel} (full res)`, `Pack downscaled to ${packPxLabel} — click Apply to World`)}
+          </div>
+          <div>Source: ${pw}×${ph} · Wall: ${bw}×${bh} blocks · MC nominal: ${ew}×${eh}px</div>
+          <div class="images-debug-cmd">
+            <code>${esc(p.summon_test)}</code>
+            <button type="button" class="btn btn-ghost btn-sm" data-copy-cmd="${esc(p.summon_test)}">Copy</button>
+          </div>
+        </div>`;
+      }).join('');
     }
-    if (info.missing_from_pack?.length) {
-      lines.push(`⚠ Missing from pack zip: ${info.missing_from_pack.join(', ')}`);
+
+    if (d.ingame_checks?.length) {
+      html += `<ul class="images-debug-checks">${d.ingame_checks.map(c => `<li>${esc(c)}</li>`).join('')}</ul>`;
     }
-    if (info.missing_from_datapack?.length) {
-      lines.push(`⚠ Missing from datapack: ${info.missing_from_datapack.join(', ')}`);
-    }
-    if (info.local_test && !info.local_test.ok) {
-      lines.push(`⚠ Pack download test failed — check Server Host in Settings.`);
-    }
-    el.textContent = lines.join('\n');
-    el.className = 'status-text ' + (lines.some(l => l.startsWith('⚠')) ? 'err' : 'ok');
-    el.classList.remove('hidden');
-  } catch {
-    el.classList.add('hidden');
+
+    panel.innerHTML = html;
+  } catch (err) {
+    panel.innerHTML = `<p class="loading" style="color:var(--danger)">${esc(err.message)}</p>`;
   }
 }
+
+async function refreshPackStatus(expectedGen) {
+  return refreshPaintingsDebug(expectedGen);
+}
+
+document.getElementById('imagesDebugContent')?.addEventListener('click', async (e) => {
+  const btn = e.target.closest('[data-copy-cmd]');
+  if (!btn) return;
+  try {
+    await navigator.clipboard.writeText(btn.dataset.copyCmd);
+    const orig = btn.textContent;
+    btn.textContent = 'Copied';
+    setTimeout(() => { btn.textContent = orig; }, 1200);
+  } catch {
+    alert('Could not copy — select the command text manually.');
+  }
+});
 
 async function rebuildPaintingsForWorld(name, expectedGen) {
   if (_rebuildInFlight) return;
@@ -481,7 +533,7 @@ async function rebuildPaintingsForWorld(name, expectedGen) {
         status.className = 'status-text ' + (pack.test && !pack.test.ok ? 'err' : 'ok');
         status.style.whiteSpace = 'pre-wrap';
       }
-      await refreshPackStatus(expectedGen);
+      await refreshPaintingsDebug(expectedGen);
     }
   } catch (err) {
     if (expectedGen == null || expectedGen === _imagesOpenGen) {
@@ -537,7 +589,7 @@ document.getElementById('imagesList').addEventListener('click', async (e) => {
   const imgName = btn.dataset.delImage;
   try {
     await apiJson('DELETE', `/api/worlds/${encodeURIComponent(_imagesWorld)}/images/${encodeURIComponent(imgName)}`);
-    await refreshImages();
+    await Promise.all([refreshImages(), refreshPaintingsDebug()]);
   } catch (err) {
     alert('Delete failed: ' + err.message);
     btn.disabled = false;
@@ -583,7 +635,7 @@ document.getElementById('imageFileInput').addEventListener('change', async (e) =
           status.textContent = '✘ ' + (err.message || 'Upload failed');
           status.className = 'status-text err';
           input.value = '';
-          await refreshImages();
+          await Promise.all([refreshImages(), refreshPaintingsDebug()]);
           return;
         }
       }
@@ -595,7 +647,7 @@ document.getElementById('imageFileInput').addEventListener('change', async (e) =
     status.className = 'status-text ' + (fail ? 'err' : 'ok');
     if (lastHint) status.style.whiteSpace = 'pre-wrap';
     input.value = '';
-    await Promise.all([refreshImages(), refreshPackStatus()]);
+    await Promise.all([refreshImages(), refreshPaintingsDebug()]);
   } finally {
     _locks.delete('imageUpload');
   }

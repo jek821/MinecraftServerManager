@@ -550,6 +550,69 @@ label.btn.is-disabled {
   border-bottom: 1px solid var(--border);
 }
 
+.images-debug-panel {
+  border-bottom: 1px solid var(--border);
+  font-size: 0.78rem;
+}
+.images-debug-panel summary {
+  cursor: pointer;
+  padding: 0.5rem 1.25rem;
+  color: var(--text-muted);
+  user-select: none;
+}
+.images-debug-panel summary:hover { color: var(--text); }
+.images-debug-content {
+  padding: 0 1.25rem 0.75rem;
+  max-height: 280px;
+  overflow-y: auto;
+}
+.images-debug-meta {
+  color: var(--text-muted);
+  margin-bottom: 0.5rem;
+  line-height: 1.45;
+}
+.images-debug-card {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.5rem 0.65rem;
+  margin-bottom: 0.5rem;
+  background: var(--surface2);
+}
+.images-debug-card.has-issue { border-color: var(--danger); }
+.images-debug-card h4 {
+  margin: 0 0 0.35rem;
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+.images-debug-flags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 0.75rem;
+  margin-bottom: 0.35rem;
+}
+.images-debug-flag.ok { color: var(--accent); }
+.images-debug-flag.warn { color: var(--danger); }
+.images-debug-cmd {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  margin-top: 0.35rem;
+}
+.images-debug-cmd code {
+  flex: 1;
+  font-size: 0.72rem;
+  word-break: break-all;
+  background: var(--surface);
+  padding: 0.25rem 0.4rem;
+  border-radius: 4px;
+}
+.images-debug-checks {
+  margin: 0.5rem 0 0;
+  padding-left: 1.1rem;
+  color: var(--text-muted);
+}
+.images-debug-checks li { margin-bottom: 0.2rem; }
+
 /* ── Give Painting Modal ──────────────────────────────────────────────────── */
 .give-body {
   display: grid;

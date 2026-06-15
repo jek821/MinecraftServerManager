@@ -205,6 +205,22 @@ def _pack_zip_stems(world_dir: Path) -> set[str]:
     return stems
 
 
+def _pack_texture_pixels(world_dir: Path, stem: str) -> tuple[int, int] | None:
+    """Return (width, height) of a painting texture inside the built resource pack zip."""
+    cached = world_dir / '.resource_pack.zip'
+    if not cached.is_file():
+        return None
+    entry = f'assets/{PAINTINGS_NS}/textures/painting/{stem}.png'
+    try:
+        with zipfile.ZipFile(cached, 'r') as zf:
+            if entry not in zf.namelist():
+                return None
+            with PILImage.open(io.BytesIO(zf.read(entry))) as img:
+                return img.size
+    except Exception:
+        return None
+
+
 def _datapack_stems(world_dir: Path) -> set[str]:
     level_name = get_level_name(world_dir)
     variant_dir = (
@@ -799,18 +815,22 @@ def _image_block_dims(path: Path) -> tuple[int, int]:
 
 
 def _image_to_painting_png(path: Path) -> bytes:
-    """Bake image to the exact pixel size Minecraft requires for the declared block dimensions."""
-    w_blocks, h_blocks = _image_block_dims(path)
-    target_w = w_blocks * 16
-    target_h = h_blocks * 16
+    """Use source image at full resolution; flatten alpha only (transparency breaks paintings)."""
     with PILImage.open(path) as img:
+        if path.suffix.lower() == '.png':
+            if img.mode in ('RGB', 'L'):
+                return path.read_bytes()
+            if img.mode == 'P' and 'transparency' not in img.info:
+                return path.read_bytes()
+            if img.mode == 'RGBA':
+                alpha_min, alpha_max = img.getchannel('A').getextrema()
+                if alpha_min == 255:
+                    return path.read_bytes()
         img = img.convert('RGBA')
         flat = PILImage.new('RGBA', img.size, (255, 255, 255, 255))
         img = PILImage.alpha_composite(flat, img).convert('RGB')
-        if img.size != (target_w, target_h):
-            img = img.resize((target_w, target_h), PILImage.Resampling.LANCZOS)
         buf = io.BytesIO()
-        img.save(buf, 'PNG')
+        img.save(buf, 'PNG', optimize=False)
         return buf.getvalue()
 
 
@@ -1439,6 +1459,83 @@ def list_images(name):
         for f in sorted(paintings_dir.iterdir())
         if _is_image_file(f)
     ])
+
+
+@app.route('/api/worlds/<name>/paintings-debug', methods=['GET'])
+@require_auth
+def paintings_debug(name):
+    """Expose file-level painting state for troubleshooting (no guessing)."""
+    world_dir = safe_child(WORLDS_DIR, name)
+    if not world_dir.is_dir():
+        return jsonify({'error': 'World not found'}), 404
+    level = get_level_name(world_dir)
+    paintings_dir = _paintings_dir(world_dir)
+    variant_dir = (
+        world_dir / level / 'datapacks' / 'mc-paintings'
+        / 'data' / PAINTINGS_NS / 'painting_variant'
+    )
+    cached = world_dir / '.resource_pack.zip'
+    props_sha1 = _read_prop(world_dir, 'resource-pack-sha1')
+    zip_sha1 = _pack_file_sha1(cached) if cached.is_file() else ''
+    pack_stems = _pack_zip_stems(world_dir)
+
+    config = load_config()
+    host = config.get('server_host', '').strip() or get_local_ip()
+    loopback = _resource_pack_url(name, '127.0.0.1').replace('https://', 'http://')
+    pack_test = _test_resource_pack_url(loopback)
+
+    entries = []
+    if paintings_dir.is_dir():
+        for img_path in sorted(paintings_dir.iterdir()):
+            if not _is_image_file(img_path):
+                continue
+            stem = _painting_stem(img_path.name)
+            w_blocks, h_blocks = _image_block_dims(img_path)
+            try:
+                with PILImage.open(img_path) as img:
+                    pw, ph = img.size
+            except Exception:
+                pw, ph = 0, 0
+            expected_w, expected_h = w_blocks * 16, h_blocks * 16
+            pack_pw, pack_ph = _pack_texture_pixels(world_dir, stem) or (0, 0)
+            variant_file = variant_dir / f'{stem}.json'
+            variant_data = None
+            if variant_file.is_file():
+                try:
+                    variant_data = json.loads(variant_file.read_text())
+                except json.JSONDecodeError:
+                    variant_data = {'error': 'invalid json'}
+            entries.append({
+                'file': img_path.name,
+                'stem': stem,
+                'pixels': [pw, ph],
+                'blocks': [w_blocks, h_blocks],
+                'minecraft_expects_pixels': [expected_w, expected_h],
+                'texture_matches_blocks': pw == expected_w and ph == expected_h,
+                'pack_texture_pixels': [pack_pw, pack_ph] if pack_pw else None,
+                'pack_matches_source': pack_pw == pw and pack_ph == ph if pack_pw else False,
+                'in_datapack': variant_file.is_file(),
+                'in_pack_zip': stem in pack_stems,
+                'variant': variant_data,
+                'summon_test': f'/summon painting ~ ~1 ~ {{variant:"{PAINTINGS_NS}:{stem}"}}',
+            })
+
+    return jsonify({
+        'world': name,
+        'level_name': level,
+        'datapack_dir': str(variant_dir.relative_to(BASE_DIR)),
+        'sha1_in_sync': bool(props_sha1 and zip_sha1 and props_sha1 == zip_sha1),
+        'props_sha1': props_sha1,
+        'zip_sha1': zip_sha1,
+        'pack_url': _resource_pack_url(name, host) if host else '',
+        'pack_download_ok': pack_test.get('ok', False),
+        'paintings': entries,
+        'ingame_checks': [
+            '/datapack list',
+            'Place a working painting, then compare with /summon test above',
+            'Rename problem image to a neutral name (e.g. wolf_portrait.png), Apply, restart, rejoin',
+        ],
+    })
 
 
 @app.route('/api/worlds/<name>/images', methods=['POST'])
