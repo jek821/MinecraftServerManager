@@ -421,8 +421,38 @@ async function openImages(name) {
   warn.classList.toggle('hidden', !!_serverHost);
   openModal('imagesModal');
   applyServerGatedButtons();
-  await refreshImages(gen);
+  await Promise.all([refreshImages(gen), refreshPackStatus(gen)]);
   if (gen === _imagesOpenGen) rebuildPaintingsForWorld(name, gen);
+}
+
+async function refreshPackStatus(expectedGen) {
+  if (!_imagesWorld) return;
+  const el = document.getElementById('imagesPackStatus');
+  if (!el) return;
+  try {
+    const info = await apiJson('GET', `/api/worlds/${encodeURIComponent(_imagesWorld)}/resource-pack-info`);
+    if (expectedGen != null && expectedGen !== _imagesOpenGen) return;
+    const lines = [];
+    if (!info.sha1_in_sync) {
+      lines.push('⚠ Pack file and server.properties SHA1 are out of sync — click Apply to World.');
+    } else {
+      lines.push('✔ Resource pack SHA1 is in sync.');
+    }
+    if (info.missing_from_pack?.length) {
+      lines.push(`⚠ Missing from pack zip: ${info.missing_from_pack.join(', ')}`);
+    }
+    if (info.missing_from_datapack?.length) {
+      lines.push(`⚠ Missing from datapack: ${info.missing_from_datapack.join(', ')}`);
+    }
+    if (info.local_test && !info.local_test.ok) {
+      lines.push(`⚠ Pack download test failed — check Server Host in Settings.`);
+    }
+    el.textContent = lines.join('\n');
+    el.className = 'status-text ' + (lines.some(l => l.startsWith('⚠')) ? 'err' : 'ok');
+    el.classList.remove('hidden');
+  } catch {
+    el.classList.add('hidden');
+  }
 }
 
 async function rebuildPaintingsForWorld(name, expectedGen) {
@@ -436,10 +466,8 @@ async function rebuildPaintingsForWorld(name, expectedGen) {
     if (expectedGen == null || expectedGen === _imagesOpenGen) {
       if (status) {
         const pack = data.pack || {};
-      let msg = 'Applied to world — restart the server for changes to take effect.';
-      if (pack.hint) {
-        msg = pack.hint;
-      } else if (pack.url) {
+        let msg = pack.hint || 'Applied to world.';
+        if (pack.url) {
           msg += `\nPack URL: ${pack.url}`;
           if (pack.image_count === 0) {
             msg += '\n⚠ No images uploaded yet — pack is empty.';
@@ -453,6 +481,7 @@ async function rebuildPaintingsForWorld(name, expectedGen) {
         status.className = 'status-text ' + (pack.test && !pack.test.ok ? 'err' : 'ok');
         status.style.whiteSpace = 'pre-wrap';
       }
+      await refreshPackStatus(expectedGen);
     }
   } catch (err) {
     if (expectedGen == null || expectedGen === _imagesOpenGen) {
@@ -488,7 +517,7 @@ async function refreshImages(expectedGen) {
         <div class="image-item">
           <div>
             <span class="image-name">${esc(img.name)}</span>
-            <span class="image-size"> — ${fmtBytes(img.size)}</span>
+            <span class="image-size"> — id: <code>${esc(img.stem || paintingStem(img.name))}</code> · ${fmtBytes(img.size)}</span>
           </div>
           <button class="btn btn-danger" style="padding:0.25rem 0.5rem;font-size:0.7rem"
             data-del-image="${esc(img.name)}">✕</button>
@@ -566,7 +595,7 @@ document.getElementById('imageFileInput').addEventListener('change', async (e) =
     status.className = 'status-text ' + (fail ? 'err' : 'ok');
     if (lastHint) status.style.whiteSpace = 'pre-wrap';
     input.value = '';
-    await refreshImages();
+    await Promise.all([refreshImages(), refreshPackStatus()]);
   } finally {
     _locks.delete('imageUpload');
   }
@@ -1059,7 +1088,9 @@ document.getElementById('givePaintingBtn').addEventListener('click', async () =>
       player: _selectedPlayer,
       painting: _selectedPainting,
     });
-    statusEl.textContent = '✔ ' + (data.response || 'Given!');
+    statusEl.textContent = '✔ ' + (data.response || 'Given!')
+    if (data.warning) statusEl.textContent += '\n' + data.warning;
+    statusEl.style.whiteSpace = 'pre-wrap';
     statusEl.className = 'give-status ok';
   } catch (err) {
     statusEl.textContent = '✘ ' + err.message;

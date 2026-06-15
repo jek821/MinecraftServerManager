@@ -188,15 +188,49 @@ def _resource_pack_url(world_name: str, host: str) -> str:
     return f'{scheme}://{host}:{_public_port()}/resourcepack/{world_name}.zip'
 
 
-def _ensure_pack_cache(world_dir: Path) -> Path:
+def _pack_file_sha1(path: Path) -> str:
+    return hashlib.sha1(path.read_bytes()).hexdigest()
+
+
+def _pack_zip_stems(world_dir: Path) -> set[str]:
     cached = world_dir / '.resource_pack.zip'
-    if not cached.exists():
-        cached.write_bytes(_build_resource_pack_zip(_paintings_dir(world_dir)))
+    if not cached.is_file():
+        return set()
+    prefix = f'assets/{PAINTINGS_NS}/textures/painting/'
+    stems: set[str] = set()
+    with zipfile.ZipFile(cached) as zf:
+        for name in zf.namelist():
+            if name.startswith(prefix) and name.endswith('.png'):
+                stems.add(name[len(prefix):-4])
+    return stems
+
+
+def _datapack_stems(world_dir: Path) -> set[str]:
+    level_name = get_level_name(world_dir)
+    variant_dir = (
+        world_dir / level_name / 'datapacks' / 'mc-paintings'
+        / 'data' / PAINTINGS_NS / 'painting_variant'
+    )
+    if not variant_dir.is_dir():
+        return set()
+    return {p.stem for p in variant_dir.glob('*.json')}
+
+
+def _ensure_pack_synced(world_dir: Path) -> Path:
+    """Return .resource_pack.zip, rebuilding if missing or SHA1 disagrees with server.properties."""
+    cached = world_dir / '.resource_pack.zip'
+    props_sha1 = _read_prop(world_dir, 'resource-pack-sha1')
+    needs_rebuild = not cached.is_file()
+    if cached.is_file() and props_sha1:
+        needs_rebuild = _pack_file_sha1(cached) != props_sha1
+    if needs_rebuild:
+        rebuild_paintings(world_dir)
+        cached = world_dir / '.resource_pack.zip'
     return cached
 
 
 def _pack_file_response(world_dir: Path) -> Response:
-    cached = _ensure_pack_cache(world_dir)
+    cached = _ensure_pack_synced(world_dir)
     data = cached.read_bytes()
     return Response(
         data,
@@ -729,6 +763,8 @@ def _validate_painting_name(filename: str, paintings_dir: Path, *, replace: str 
             f'"{Path(filename).stem}" is not a valid painting id — use letters, numbers, '
             'and underscores; must start with a letter'
         )
+    if len(stem) > 64:
+        return f'Painting id "{stem[:20]}…" is too long ({len(stem)} chars) — rename the file to something shorter'
     if paintings_dir.exists():
         for existing in paintings_dir.iterdir():
             if not _is_image_file(existing):
@@ -760,14 +796,19 @@ def _image_block_dims(path: Path) -> tuple[int, int]:
 
 
 def _image_to_painting_png(path: Path) -> bytes:
-    """Resize image to the exact pixel size Minecraft expects for its block dimensions."""
-    w_blocks, h_blocks = _image_block_dims(path)
-    target_w = w_blocks * 16
-    target_h = h_blocks * 16
+    """Prepare a painting texture at full resolution (Minecraft scales it to the wall size)."""
     with PILImage.open(path) as img:
+        if path.suffix.lower() == '.png':
+            if img.mode in ('RGB', 'L', 'P'):
+                return path.read_bytes()
+            if img.mode == 'RGBA':
+                alpha_min, alpha_max = img.getchannel('A').getextrema()
+                if alpha_min == 255:
+                    return path.read_bytes()
         img = img.convert('RGBA')
-        if img.size != (target_w, target_h):
-            img = img.resize((target_w, target_h), PILImage.Resampling.LANCZOS)
+        # Paintings ignore transparency — partial alpha renders fully invisible.
+        flat = PILImage.new('RGBA', img.size, (255, 255, 255, 255))
+        img = PILImage.alpha_composite(flat, img).convert('RGB')
         buf = io.BytesIO()
         img.save(buf, 'PNG')
         return buf.getvalue()
@@ -799,6 +840,7 @@ def _rebuild_datapack(world_dir: Path, paintings_dir: Path) -> None:
     variant_dir.mkdir(parents=True)
     (dp_root / 'pack.mcmeta').write_text(_DP_MCMETA)
 
+    stems: list[str] = []
     if paintings_dir.exists():
         for img_path in sorted(paintings_dir.iterdir()):
             if not _is_image_file(img_path):
@@ -810,6 +852,14 @@ def _rebuild_datapack(world_dir: Path, paintings_dir: Path) -> None:
                 "width": w,
                 "height": h,
             }, indent=2))
+            stems.append(stem)
+
+    if stems:
+        tag_dir = dp_root / 'data' / 'minecraft' / 'tags' / 'painting_variant'
+        tag_dir.mkdir(parents=True, exist_ok=True)
+        (tag_dir / 'placeable.json').write_text(json.dumps({
+            "values": [f"{PAINTINGS_NS}:{s}" for s in stems],
+        }, indent=2))
 
 
 def _update_server_properties(world_dir: Path, updates: dict[str, str]) -> None:
@@ -1048,11 +1098,15 @@ def _rebuild_paintings_locked(world_dir: Path) -> dict:
         pack_info['image_count'] = sum(1 for f in paintings_dir.iterdir() if _is_image_file(f))
     if host:
         url = _resource_pack_url(world_dir.name, host)
-        _update_server_properties(world_dir, {
+        prop_updates = {
             'resource-pack': url,
             'resource-pack-sha1': sha1,
             'server-port': str(_mc_internal_port()),
-        })
+        }
+        if pack_info['image_count'] > 0:
+            prop_updates['require-resource-pack'] = 'true'
+            prop_updates['resource-pack-prompt'] = 'This server uses custom paintings'
+        _update_server_properties(world_dir, prop_updates)
         loopback = _resource_pack_url(world_dir.name, '127.0.0.1').replace('https://', 'http://')
         pack_info.update({
             'url': url,
@@ -1068,13 +1122,12 @@ def _rebuild_paintings_locked(world_dir: Path) -> dict:
         _ensure_mc_internal_port(world_dir)
 
     _ensure_rcon(world_dir)
-    pack_info['reloaded'] = False
-    if _is_mc_live():
-        pack_info['reloaded'] = _rcon_on_active('reload') is not None
     pack_info['needs_restart'] = True
     pack_info['hint'] = (
-        'Restart the server, then leave and rejoin the world so your client '
-        'downloads the updated resource pack.'
+        'Start the server when you are done editing images. Then leave the world '
+        'completely (disconnect / quit to menu) and rejoin — accept the resource '
+        'pack prompt. Stopping the server only unlocks uploads; your game client '
+        'still needs to download the new pack after you start again.'
     )
     return pack_info
 
@@ -1378,7 +1431,11 @@ def list_images(name):
     if not paintings_dir.exists():
         return jsonify([])
     return jsonify([
-        {'name': f.name, 'size': f.stat().st_size}
+        {
+            'name': f.name,
+            'stem': _painting_stem(f.name),
+            'size': f.stat().st_size,
+        }
         for f in sorted(paintings_dir.iterdir())
         if _is_image_file(f)
     ])
@@ -2270,16 +2327,33 @@ def rcon_give(name):
     cfg = _rcon_settings(world_dir)
     if not cfg['enabled'] or not cfg['password']:
         return jsonify({'error': 'RCON not configured'}), 400
+    level_name = get_level_name(world_dir)
+    variant_file = (
+        world_dir / level_name / 'datapacks' / 'mc-paintings'
+        / 'data' / PAINTINGS_NS / 'painting_variant' / f'{painting}.json'
+    )
+    if not variant_file.is_file():
+        return jsonify({
+            'error': 'Painting not built yet — upload the image, apply to world, then restart the server',
+        }), 400
     try:
-        cmd = f'give {player} minecraft:painting[minecraft:painting_variant={PAINTINGS_NS}:{painting}]'
+        variant_id = f'{PAINTINGS_NS}:{painting}'
+        cmd = f'give {player} minecraft:painting[minecraft:painting_variant="{variant_id}"]'
         raw = _rcon_exec('localhost', cfg['port'], cfg['password'], cmd)
         if 'Unknown item component' in raw:
             cmd = (
                 f'give {player} minecraft:painting[minecraft:entity_data='
-                f'{{id:"minecraft:painting",variant:"{PAINTINGS_NS}:{painting}"}}]'
+                f'{{id:"minecraft:painting",variant:"{variant_id}"}}]'
             )
             raw = _rcon_exec('localhost', cfg['port'], cfg['password'], cmd)
-        return jsonify({'ok': True, 'response': re.sub(r'§.', '', raw)})
+        resp: dict = {'ok': True, 'response': re.sub(r'§.', '', raw)}
+        if _is_mc_live():
+            resp['warning'] = (
+                'After giving a new painting: if it is invisible when placed, quit to the '
+                'menu and rejoin (accept the resource pack). You already stop the server '
+                'to upload — the missing step is usually rejoining the game client.'
+            )
+        return jsonify(resp)
     except RCONError as e:
         return jsonify({'error': str(e)}), 503
 
@@ -2411,14 +2485,25 @@ def resource_pack_info(name):
     host = config.get('server_host', '').strip() or get_local_ip()
     loopback = _resource_pack_url(name, '127.0.0.1').replace('https://', 'http://')
     cached = world_dir / '.resource_pack.zip'
+    zip_sha1 = _pack_file_sha1(cached) if cached.is_file() else ''
+    paintings = _paintings_dir(world_dir)
+    image_stems = sorted(_painting_stem(f.name) for f in paintings.iterdir() if _is_image_file(f)) if paintings.exists() else []
+    pack_stems = sorted(_pack_zip_stems(world_dir))
+    dp_stems = sorted(_datapack_stems(world_dir))
     return jsonify({
         'url': url,
         'sha1': sha1,
+        'zip_sha1': zip_sha1,
+        'sha1_in_sync': bool(sha1 and zip_sha1 and sha1 == zip_sha1),
         'expected_url': _resource_pack_url(name, host) if host else '',
         'scheme': _resource_pack_scheme(host) if host else '',
         'cached_bytes': cached.stat().st_size if cached.exists() else 0,
-        'image_count': sum(1 for f in _paintings_dir(world_dir).iterdir() if _is_image_file(f))
-            if _paintings_dir(world_dir).exists() else 0,
+        'image_count': len(image_stems),
+        'image_stems': image_stems,
+        'pack_stems': pack_stems,
+        'datapack_stems': dp_stems,
+        'missing_from_pack': [s for s in image_stems if s not in pack_stems],
+        'missing_from_datapack': [s for s in image_stems if s not in dp_stems],
         'local_test': _test_resource_pack_url(loopback),
         'curl_test': f'curl -I {loopback}',
     })
@@ -2780,6 +2865,10 @@ def start_server():
     if (world_dir / 'server.properties').exists():
         _ensure_mc_internal_port(world_dir)
         _ensure_rcon(world_dir)
+    try:
+        rebuild_paintings(world_dir)
+    except Exception as e:
+        app.logger.error('rebuild_paintings before server start failed for %s: %s', active_world, e)
     java_cmd = config.get('java_cmd', 'java')
     jvm_args = shlex.split(config.get('jvm_args', _AIKAR_FLAGS))
 
