@@ -52,6 +52,7 @@ Players / browser  →  :25565 (public)
 |----------|---------|-------------|
 | `MC_PASSWORD` | `admin` | Web UI login password. **Change this.** |
 | `SERVER_NAME` | `MC` | Shown on the login page |
+| `WEB_UI_LOCAL_ONLY` | off | If `1`, block web UI from the public internet (SSH tunnel only) |
 | `SECRET_KEY` | auto-generated | Flask session key (stored in `.secret_key` if unset) |
 
 ## Directory layout
@@ -90,11 +91,34 @@ Re-running pre-gen on the same center and radius after a completed job is safe b
 
 This is a **single-password** admin tool, not multi-user hosting software.
 
-- Set a strong `MC_PASSWORD` before exposing the host.
+### How exposure works
+
+The web panel is **not hidden behind SSH**. Port 25565 is public so players can connect. The port multiplexer sends **HTTP** traffic to the admin UI and **Minecraft protocol** traffic to the game server on the same port. Anyone who can reach `:25565` can open the login page.
+
+Flask itself only listens on `127.0.0.1:17891` (not directly reachable from the internet). The proxy on `:25565` is what exposes the UI.
+
+An SSH tunnel (see below) is a **convenient way to open the panel from your laptop** — it does **not** block public access unless you enable local-only mode.
+
+### Recommended: lock admin to SSH tunnel
+
+```bash
+WEB_UI_LOCAL_ONLY=1 MC_PASSWORD="long-random-password" ./webapp/run.sh
+```
+
+With this set, external HTTP to the web UI returns **403**. Minecraft and resource-pack downloads still work for everyone. Admin access:
+
+```bash
+ssh -L 8080:127.0.0.1:25565 user@your-server -p 2222
+# then open http://localhost:8080
+```
+
+### Other hardening
+
+- Set a strong `MC_PASSWORD` before exposing the host (default is `admin`).
 - Login allows **10 failed attempts per IP**, then a **10-hour lockout**. Lockouts are in-memory and reset when the app restarts.
-- The web UI is served on the same port as Minecraft. Anyone who can reach `:25565` can attempt to log in.
+- Password and session cookies travel over **plain HTTP** unless you terminate TLS elsewhere — use the SSH tunnel on untrusted networks.
 - RCON passwords are stored in each world's `server.properties`.
-- Intended for private servers (friends, homelab). Review your firewall and exposure before putting it on the public internet.
+- Intended for private servers (friends, homelab). Review firewall and exposure before putting it on the public internet.
 
 ## Limitations
 

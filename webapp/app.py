@@ -55,6 +55,7 @@ def _load_secret_key() -> str:
 app.secret_key = _load_secret_key()
 PASSWORD = os.environ.get('MC_PASSWORD', 'admin')
 SERVER_NAME = os.environ.get('SERVER_NAME', 'MC')
+WEB_UI_LOCAL_ONLY = os.environ.get('WEB_UI_LOCAL_ONLY', '').lower() in ('1', 'true', 'yes')
 
 PAINTINGS_NS = 'mcpainting'
 # Broad supported_formats range so the pack loads across many MC versions
@@ -763,11 +764,50 @@ def _read_prop(world_dir: Path, key: str) -> str:
 
 
 def _offline_player_uuid(name: str) -> str:
+    """UUID for online-mode=false servers only (Java UUID.nameUUIDFromBytes)."""
     data = hashlib.md5(f'OfflinePlayer:{name}'.encode()).digest()
     b = bytearray(data)
     b[6] = (b[6] & 0x0f) | 0x30
     b[8] = (b[8] & 0x3f) | 0x80
     return str(uuid.UUID(bytes=bytes(b)))
+
+
+def _online_mode_enabled(world_dir: Path) -> bool:
+    val = _read_prop(world_dir, 'online-mode')
+    return val.lower() == 'true' if val else True
+
+
+def _lookup_mojang_uuid(name: str) -> tuple[str, str] | None:
+    """Resolve a Java account to (uuid-with-hyphens, canonical_name), or None if unknown."""
+    try:
+        r = requests.get(
+            f'https://api.mojang.com/users/profiles/minecraft/{name}',
+            timeout=15,
+        )
+    except requests.RequestException as e:
+        raise ValueError(f'Could not reach Mojang API: {e}') from e
+    if r.status_code == 404:
+        return None
+    r.raise_for_status()
+    data = r.json()
+    raw = data.get('id', '')
+    if len(raw) != 32:
+        return None
+    formatted = f'{raw[:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:]}'
+    return formatted, data.get('name', name)
+
+
+def _resolve_player_uuid(name: str, world_dir: Path) -> tuple[str, str]:
+    """Whitelist UUID + name. Uses Mojang API when online-mode=true."""
+    if _online_mode_enabled(world_dir):
+        result = _lookup_mojang_uuid(name)
+        if result is None:
+            raise ValueError(
+                f'No Mojang account found for "{name}". '
+                'Check spelling, or set online-mode=false for offline-only players.'
+            )
+        return result
+    return _offline_player_uuid(name), name
 
 
 def _read_whitelist(world_dir: Path) -> list[dict]:
@@ -2481,7 +2521,11 @@ def whitelist_add():
             return jsonify({'error': 'Server is running but RCON command failed'}), 503
         entries = _read_whitelist(world_dir)
     else:
-        entries.append({'uuid': _offline_player_uuid(player), 'name': player})
+        try:
+            resolved_uuid, canonical_name = _resolve_player_uuid(player, world_dir)
+        except ValueError as e:
+            return jsonify({'error': str(e)}), 400
+        entries.append({'uuid': resolved_uuid, 'name': canonical_name})
         _write_whitelist(world_dir, entries)
     return jsonify({'ok': True})
 
@@ -2741,8 +2785,11 @@ if __name__ == '__main__':
         pack_port=PACK_PORT,
         ssl_context=tls_ctx,
         worlds_dir=WORLDS_DIR,
+        web_ui_local_only=WEB_UI_LOCAL_ONLY,
     )
     print(f'Public port {public}: Minecraft + resource packs + web UI')
+    if WEB_UI_LOCAL_ONLY:
+        print('Web UI: localhost-only — use SSH tunnel (see README Security section)')
     print(f'Minecraft binds internally on port {internal}')
     print(f'Flask (internal): {FLASK_HOST}:{FLASK_PORT}')
     if host:

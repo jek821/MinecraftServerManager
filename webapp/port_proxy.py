@@ -112,6 +112,7 @@ def _handle_client(
     flask_port: int,
     pack_port: int,
     ssl_context: ssl.SSLContext | None,
+    web_ui_local_only: bool = False,
 ) -> None:
     try:
         is_http = _is_http_peek(client)
@@ -127,6 +128,20 @@ def _handle_client(
             buf = _inject_forwarded_for(buf, client_addr[0])
             _method, path = _parse_http(buf)
             dest_port = _http_backend_port(path, pack_port, flask_port)
+            if (
+                web_ui_local_only
+                and dest_port == flask_port
+                and client_addr[0] not in ('127.0.0.1', '::1')
+            ):
+                client.sendall(
+                    b'HTTP/1.1 403 Forbidden\r\n'
+                    b'Content-Type: text/plain\r\n'
+                    b'Connection: close\r\n'
+                    b'\r\n'
+                    b'Web admin is localhost-only. Use an SSH tunnel to access it.\r\n'
+                )
+                client.close()
+                return
             backend = socket.create_connection((flask_host, dest_port), timeout=30)
             backend.sendall(buf)
             _relay_bidirectional(client, backend)
@@ -150,6 +165,7 @@ def _listen_loop(
     flask_port: int,
     pack_port: int,
     ssl_context: ssl.SSLContext | None,
+    web_ui_local_only: bool = False,
 ) -> None:
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -159,7 +175,10 @@ def _listen_loop(
         client, addr = listener.accept()
         threading.Thread(
             target=_handle_client,
-            args=(client, addr, mc_host, mc_port, flask_host, flask_port, pack_port, ssl_context),
+            args=(
+                client, addr, mc_host, mc_port, flask_host, flask_port, pack_port,
+                ssl_context, web_ui_local_only,
+            ),
             daemon=True,
         ).start()
 
@@ -173,6 +192,7 @@ def start_port_proxy(
     public_host: str = '0.0.0.0',
     ssl_context: ssl.SSLContext | None = None,
     worlds_dir: Path | None = None,
+    web_ui_local_only: bool = False,
 ) -> threading.Thread:
     if worlds_dir is None:
         raise ValueError('worlds_dir is required')
@@ -180,7 +200,10 @@ def start_port_proxy(
     start_pack_server(worlds_dir, flask_host, pack_port)
     thread = threading.Thread(
         target=_listen_loop,
-        args=(public_host, public_port, '127.0.0.1', mc_port, flask_host, flask_port, pack_port, ssl_context),
+        args=(
+            public_host, public_port, '127.0.0.1', mc_port, flask_host, flask_port,
+            pack_port, ssl_context, web_ui_local_only,
+        ),
         daemon=True,
         name='port-proxy',
     )

@@ -1,4 +1,7 @@
-MC_PASSWORD="password" SERVER_NAME="server_name" ./webapp/run.sh
+WEB_UI_LOCAL_ONLY=1 MC_PASSWORD="strong-password" SERVER_NAME="server_name" ./webapp/run.sh
 
-ssh -L 8080:localhost:25565 dorian@108.46.133.187 -p 2222
-    (opens at localhost:8080)
+# Admin panel (localhost-only when WEB_UI_LOCAL_ONLY=1):
+ssh -L 8080:127.0.0.1:25565 dorian@108.46.133.187 -p 2222
+# open http://localhost:8080
+
+# Players still connect to 108.46.133.187:25565 as usual (Minecraft only).
