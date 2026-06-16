@@ -431,6 +431,77 @@ function _debugFlag(ok, okLabel, badLabel) {
   return `<span class="images-debug-flag ${cls}">${esc(text)}</span>`;
 }
 
+function _debugServerFlag(val, okLabel, badLabel, unknownLabel) {
+  if (val === true) return _debugFlag(true, okLabel, badLabel);
+  if (val === false) return _debugFlag(false, okLabel, badLabel);
+  return `<span class="images-debug-flag">${esc(unknownLabel || 'Not tested')}</span>`;
+}
+
+function _renderPaintingsServerDebug(live) {
+  const box = document.getElementById('imagesDebugServer');
+  if (!box) return;
+  box.classList.remove('hidden');
+
+  let html = `<div class="images-debug-meta">
+    Datapack loaded: ${live.datapack_loaded ? '<strong style="color:var(--accent)">yes (mc-paintings)</strong>' : '<strong style="color:var(--danger)">NO</strong>'}
+    · Players: ${live.players_online?.length ? esc(live.players_online.join(', ')) : 'none'}
+  </div>`;
+  if (live.datapack_list) {
+    html += `<div class="images-debug-cmd-row"><strong>datapack list</strong><code>${esc(live.datapack_list)}</code></div>`;
+  }
+
+  for (const p of live.paintings || []) {
+    const fi = p.file || {};
+    const summonIssue = p.summon_ok === false;
+    const giveIssue = p.give_ok === false;
+    const texMismatch = fi.texture_matches_blocks === false;
+    const issue = summonIssue || giveIssue;
+    html += `<div class="images-debug-card${issue ? ' has-issue' : ''}">
+      <h4>Server: <code>${esc(p.variant)}</code>${fi.file ? ` (${esc(fi.file)})` : ''}</h4>
+      <div class="images-debug-flags">
+        ${_debugServerFlag(p.summon_ok, 'Summon OK', 'Summon FAILED', 'Summon ?')}
+        ${_debugServerFlag(p.give_ok, `Give OK → ${esc(p.give_player || '')}`, 'Give FAILED', p.give_note || 'Give not tested')}
+        ${_debugFlag(!texMismatch, 'Texture matches block size', `Texture ${fi.pixels?.join('×')} ≠ nominal ${fi.minecraft_expects_pixels?.join('×')}px`)}
+      </div>`;
+    if (p.entity_variant) {
+      html += `<div>Entity variant: <code>${esc(p.entity_variant)}</code></div>`;
+    }
+    for (const c of p.commands || []) {
+      html += `<div class="images-debug-cmd-row"><code>${esc(c.command)}</code> → ${esc(c.response || '(empty)')}</div>`;
+    }
+    html += '</div>';
+  }
+
+  if (live.interpretation) {
+    html += `<p class="images-debug-checks" style="margin-top:0.5rem">${esc(live.interpretation)}</p>`;
+  }
+  box.innerHTML = html;
+}
+
+async function runPaintingsServerDebug() {
+  if (!_imagesWorld) return;
+  const btn = document.getElementById('imagesDebugServerBtn');
+  const status = document.getElementById('imagesDebugServerStatus');
+  if (btn) btn.disabled = true;
+  if (status) status.textContent = 'Running RCON commands…';
+  try {
+    const live = await apiJson('POST', `/api/worlds/${encodeURIComponent(_imagesWorld)}/paintings-debug/live`, {});
+    _renderPaintingsServerDebug(live);
+    if (status) status.textContent = 'Done — compare working vs broken rows above.';
+    const details = document.getElementById('imagesDebugPanel');
+    if (details) details.open = true;
+  } catch (err) {
+    if (status) status.textContent = err.message;
+    const box = document.getElementById('imagesDebugServer');
+    if (box) {
+      box.classList.remove('hidden');
+      box.innerHTML = `<p style="color:var(--danger)">${esc(err.message)}</p>`;
+    }
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 async function refreshPaintingsDebug(expectedGen) {
   if (!_imagesWorld) return;
   const panel = document.getElementById('imagesDebugContent');
@@ -493,6 +564,10 @@ async function refreshPaintingsDebug(expectedGen) {
 async function refreshPackStatus(expectedGen) {
   return refreshPaintingsDebug(expectedGen);
 }
+
+document.getElementById('imagesDebugServerBtn')?.addEventListener('click', () => {
+  runPaintingsServerDebug();
+});
 
 document.getElementById('imagesDebugContent')?.addEventListener('click', async (e) => {
   const btn = e.target.closest('[data-copy-cmd]');

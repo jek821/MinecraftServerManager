@@ -221,6 +221,114 @@ def _pack_texture_pixels(world_dir: Path, stem: str) -> tuple[int, int] | None:
         return None
 
 
+def _mc_strip(text: str) -> str:
+    return re.sub(r'§.', '', text).strip()
+
+
+def _rcon_for_world(world_dir: Path) -> tuple[dict, str | None]:
+    cfg = _rcon_settings(world_dir)
+    if not cfg['enabled']:
+        return cfg, 'RCON not enabled in server.properties'
+    if not cfg['password']:
+        return cfg, 'rcon.password is not set in server.properties'
+    return cfg, None
+
+
+def _rcon_run(cfg: dict, command: str) -> str:
+    return _mc_strip(_rcon_exec('localhost', cfg['port'], cfg['password'], command))
+
+
+def _summon_result_ok(output: str) -> bool | None:
+    lower = output.lower()
+    if 'summoned' in lower:
+        return True
+    if any(x in lower for x in ('invalid', 'unable', 'unknown', 'incorrect', 'failed', 'no entity')):
+        return False
+    return None if not output else None
+
+
+def _give_result_ok(output: str) -> bool | None:
+    lower = output.lower()
+    if 'gave' in lower:
+        return True
+    if any(x in lower for x in ('unknown', 'invalid', 'unable', 'incorrect', 'no such')):
+        return False
+    return None
+
+
+_PAINTING_DBG_TAG = 'mcpaint_dbg'
+_PAINTING_DBG_POS = ('29999989.5', '-64', '29999989.5')
+
+
+def _live_painting_checks(world_dir: Path, stems: list[str], *, test_player: str | None) -> dict:
+    """Run RCON commands on the live server to verify painting variants."""
+    cfg, err = _rcon_for_world(world_dir)
+    if err:
+        raise RCONError(err)
+
+    out: dict = {
+        'datapack_list': '',
+        'datapack_loaded': False,
+        'players_online': [],
+        'test_player': test_player,
+        'paintings': [],
+    }
+
+    out['datapack_list'] = _rcon_run(cfg, 'datapack list')
+    out['datapack_loaded'] = 'mc-paintings' in out['datapack_list'].lower()
+
+    list_raw = _rcon_run(cfg, 'list')
+    m = re.search(r'players online:\s*(.*)', list_raw, re.I)
+    if m and m.group(1).strip():
+        out['players_online'] = [p.strip() for p in m.group(1).split(',') if p.strip()]
+
+    x, y, z = _PAINTING_DBG_POS
+    _rcon_run(cfg, f'kill @e[type=painting,tag={_PAINTING_DBG_TAG}]')
+
+    for stem in stems:
+        variant = f'{PAINTINGS_NS}:{stem}'
+        entry: dict = {'stem': stem, 'variant': variant, 'commands': []}
+
+        summon_cmd = (
+            f'summon painting {x} {y} {z} {{variant:"{variant}",Tags:["{_PAINTING_DBG_TAG}"]}}'
+        )
+        summon_resp = _rcon_run(cfg, summon_cmd)
+        entry['commands'].append({'command': summon_cmd, 'response': summon_resp})
+        entry['summon_ok'] = _summon_result_ok(summon_resp)
+
+        data_cmd = f'data get entity @e[type=painting,tag={_PAINTING_DBG_TAG},limit=1] variant'
+        data_resp = _rcon_run(cfg, data_cmd)
+        entry['commands'].append({'command': data_cmd, 'response': data_resp})
+        entry['entity_variant'] = data_resp
+        entry['entity_has_variant'] = variant in data_resp
+
+        _rcon_run(cfg, f'kill @e[type=painting,tag={_PAINTING_DBG_TAG}]')
+
+        player = test_player or (out['players_online'][0] if out['players_online'] else None)
+        if player:
+            give_cmd = f'give {player} minecraft:painting[minecraft:painting_variant="{variant}"]'
+            give_resp = _rcon_run(cfg, give_cmd)
+            entry['commands'].append({'command': give_cmd, 'response': give_resp})
+            give_ok = _give_result_ok(give_resp)
+            if give_ok is False and 'Unknown item component' in give_resp:
+                give_cmd = (
+                    f'give {player} minecraft:painting[minecraft:entity_data='
+                    f'{{id:"minecraft:painting",variant:"{variant}"}}]'
+                )
+                give_resp = _rcon_run(cfg, give_cmd)
+                entry['commands'].append({'command': give_cmd, 'response': give_resp})
+                give_ok = _give_result_ok(give_resp)
+            entry['give_ok'] = give_ok
+            entry['give_player'] = player
+        else:
+            entry['give_ok'] = None
+            entry['give_note'] = 'No players online — join the server to test give'
+
+        out['paintings'].append(entry)
+
+    return out
+
+
 def _datapack_stems(world_dir: Path) -> set[str]:
     level_name = get_level_name(world_dir)
     variant_dir = (
@@ -1531,11 +1639,78 @@ def paintings_debug(name):
         'pack_download_ok': pack_test.get('ok', False),
         'paintings': entries,
         'ingame_checks': [
-            '/datapack list',
-            'Place a working painting, then compare with /summon test above',
-            'Rename problem image to a neutral name (e.g. wolf_portrait.png), Apply, restart, rejoin',
+            'Use Run server checks (server must be running this world)',
+            '/datapack list — mc-paintings should appear',
+            '/summon painting ~ ~1 ~ {variant:"mcpainting:<stem>"} — compare working vs broken',
+            '/data get entity @e[type=painting,limit=1,sort=nearest] variant — after placing',
         ],
     })
+
+
+@app.route('/api/worlds/<name>/paintings-debug/live', methods=['POST'])
+@require_auth
+def paintings_debug_live(name):
+    """Run RCON commands on the live server to verify painting variants (no guessing)."""
+    world_dir = safe_child(WORLDS_DIR, name)
+    if not world_dir.is_dir():
+        return jsonify({'error': 'World not found'}), 404
+
+    active = load_config().get('active_world')
+    if active != name:
+        return jsonify({
+            'error': (
+                f'Start world "{name}" first — the server is on '
+                f'"{active or "no active world"}"'
+            ),
+        }), 400
+
+    if not _is_mc_live():
+        return jsonify({'error': 'Minecraft server is not running'}), 400
+
+    paintings_dir = _paintings_dir(world_dir)
+    stems: list[str] = []
+    file_info: dict[str, dict] = {}
+    if paintings_dir.is_dir():
+        for img_path in sorted(paintings_dir.iterdir()):
+            if not _is_image_file(img_path):
+                continue
+            stem = _painting_stem(img_path.name)
+            stems.append(stem)
+            w_blocks, h_blocks = _image_block_dims(img_path)
+            try:
+                with PILImage.open(img_path) as img:
+                    pw, ph = img.size
+            except Exception:
+                pw, ph = 0, 0
+            expected_w, expected_h = w_blocks * 16, h_blocks * 16
+            file_info[stem] = {
+                'file': img_path.name,
+                'pixels': [pw, ph],
+                'blocks': [w_blocks, h_blocks],
+                'minecraft_expects_pixels': [expected_w, expected_h],
+                'texture_matches_blocks': pw == expected_w and ph == expected_h,
+            }
+
+    data = request.get_json(silent=True) or {}
+    test_player = (data.get('player') or '').strip() or None
+    if test_player and not re.match(r'^[a-zA-Z0-9_]{1,16}$', test_player):
+        return jsonify({'error': 'Invalid player name'}), 400
+
+    try:
+        live = _live_painting_checks(world_dir, stems, test_player=test_player)
+    except RCONError as e:
+        return jsonify({'error': str(e)}), 503
+
+    for entry in live['paintings']:
+        entry['file'] = file_info.get(entry['stem'], {})
+
+    live['interpretation'] = (
+        'If summon_ok and give_ok are true but a painting is invisible when placed, '
+        'the datapack/registry is fine — suspect texture size vs blocks (see texture_matches_blocks) '
+        'or client resource pack cache (quit to menu and rejoin). '
+        'If summon_ok is false, the server does not know that variant — datapack not loaded or wrong id.'
+    )
+    return jsonify(live)
 
 
 @app.route('/api/worlds/<name>/images', methods=['POST'])
